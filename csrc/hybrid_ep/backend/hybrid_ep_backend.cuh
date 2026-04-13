@@ -1519,13 +1519,22 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
                                              (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE)));
 
                     // Store the prob from shared to remote global for FW dispatch.
+                    // Only send the destination rank's E_per_rank slice (not the full E*R vector).
+                    // The source SMEM prob buffer contains the full E*R probs (mostly zeros for sparse routing).
+                    // Each rank's E_per_rank slice already has zeros at non-active expert positions.
                     if constexpr(FORWARD_DISPATCH){
-                      float* remote_prob_addr = remote_expert_output_prob[remote_rank_id] + (output_buffer_index * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE));
+                      static_assert(NUM_OF_EXPERTS_PER_RANK * sizeof(float) >= 16,
+                          "NUM_OF_EXPERTS_PER_RANK * sizeof(float) must be >= 16 for TMA minimum transfer size.");
+                      static_assert((NUM_OF_EXPERTS_PER_RANK * sizeof(float)) % 16 == 0,
+                          "NUM_OF_EXPERTS_PER_RANK * sizeof(float) must be 16B-aligned for TMA.");
+                      float* remote_prob_addr = remote_expert_output_prob[remote_rank_id]
+                          + output_buffer_index * static_cast<int64_t>(NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE)
+                          + remote_rank_id * NUM_OF_EXPERTS_PER_RANK;
                       cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
                                                cuda::ptx::space_shared,
                                                reinterpret_cast<void*>(remote_prob_addr),
-                                               reinterpret_cast<const void*>(&smem_buffer_ptr->intra_node_prob_buffer[stage][0]),
-                                               (uint32_t)((NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE) * sizeof(float)));
+                                               reinterpret_cast<const void*>(&smem_buffer_ptr->intra_node_prob_buffer[stage][remote_rank_id * NUM_OF_EXPERTS_PER_RANK]),
+                                               (uint32_t)(NUM_OF_EXPERTS_PER_RANK * sizeof(float)));
 
                     }
 
