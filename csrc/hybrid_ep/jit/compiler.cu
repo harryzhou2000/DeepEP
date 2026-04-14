@@ -258,7 +258,7 @@ node_rank(node_rank), local_rank(local_rank), nvcc_compiler(base_path, comm_id) 
 
 void KernelCache::run_preprocess_kernel(
     HybridEpConfigInstance config, 
-    const bool* input_routing_map,
+    const void* input_routing_map,
     hybrid_ep::tmp_state_t* preprocessing_tmp,
     hybrid_ep::tmp_state_t* preprocessing_local_experts_tmp,
     int32_t* sparse_to_dense_map,
@@ -303,7 +303,7 @@ void KernelCache::run_preprocess_kernel(
     auto preprocessing_instance = kernel_cache[preprocess_kernel_key];
 
     // Cast the function pointer to the correct type
-    using PreprocessingFuncPtr = void (*)(const bool*, hybrid_ep::tmp_state_t*, hybrid_ep::tmp_state_t*, int32_t*, bool*, bool*, int32_t*, bool*, int32_t*, int32_t*, int32_t*, int*, const int, const int, const int, const int, cudaStream_t);
+    using PreprocessingFuncPtr = void (*)(const void*, hybrid_ep::tmp_state_t*, hybrid_ep::tmp_state_t*, int32_t*, bool*, bool*, int32_t*, bool*, int32_t*, int32_t*, int32_t*, int*, const int, const int, const int, const int, cudaStream_t);
     auto func_ptr = std::any_cast<PreprocessingFuncPtr>(preprocessing_instance);
 
     // Run the kernel
