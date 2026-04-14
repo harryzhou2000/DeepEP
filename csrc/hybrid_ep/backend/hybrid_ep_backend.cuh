@@ -3127,7 +3127,7 @@ template<typename SMEM_TYPE,
          int NUM_OF_NODES,
          int NUM_OF_BLOCKS,
          int NUM_OF_TOKENS_PER_GROUP,
-         int NUM_OF_COMBINE_REDUCE_BATCH_SIZE,
+         int NUM_TOKENS_COMBINE_REDUCE_BATCH,
          bool BACKWARD_COMBINE>
 inline __device__ void inter_node_red_warp_group_device_function(const int node_rank,
                                                                  const int num_of_tokens_per_rank,
@@ -3255,7 +3255,7 @@ inline __device__ void inter_node_red_warp_group_device_function(const int node_
         if(token_needed_by_this_node){
           // Batched accumulation: wait for up to B mbarriers, barrier once, accumulate all B,
           // barrier once, free all B. Reduces barriers from 2*N to 2*ceil(N/B) per output token.
-          constexpr int BATCH_SIZE = NUM_OF_COMBINE_REDUCE_BATCH_SIZE;
+          constexpr int BATCH_SIZE = NUM_TOKENS_COMBINE_REDUCE_BATCH;
           bool last_local_node_src_token = false;
 
           do {
@@ -4509,7 +4509,7 @@ template<// This type represent intra-node reduction warp group.
          // Number of fully in-flight S2G in unpermute reduction warp group.
          int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_UNPERMUTE_BLOCKS,
          // Number of G2S slots to accumulate per batch in the combine reduction loop.
-         int NUM_OF_COMBINE_REDUCE_BATCH_SIZE,
+         int NUM_TOKENS_COMBINE_REDUCE_BATCH,
          // Whether the combine kernel is used in backward process. If so, need to transfer the prob for each token as well.
          bool BACKWARD_COMBINE>
 // Each CUDA block of combine kernel has 5 warp groups and has the following layout: 
@@ -4649,7 +4649,7 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t pa
       // Inter-node reduction warp group.
       inter_node_red_warp_group_device_function
       <cur_smem_t, INTER_NODE_RED_GROUP, NUM_OF_DATA_PIPELINE_PER_BLOCK, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_EXPERTS_PER_RANK,
-      NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, NUM_OF_COMBINE_REDUCE_BATCH_SIZE, BACKWARD_COMBINE>
+      NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, NUM_TOKENS_COMBINE_REDUCE_BATCH, BACKWARD_COMBINE>
       (param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.attn_to_rdma_map, param.attn_output_token, param.attn_output_prob, smem_buffer_ptr);
     }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
       // Intra-node G2S warp group.
@@ -4714,7 +4714,7 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t pa
     // Inter-node reduction warp group.
     inter_node_red_warp_group_device_function
     <cur_smem_t, INTER_NODE_RED_GROUP, NUM_OF_DATA_PIPELINE_PER_BLOCK, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_EXPERTS_PER_RANK,
-    NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, NUM_OF_COMBINE_REDUCE_BATCH_SIZE, BACKWARD_COMBINE>
+    NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, NUM_TOKENS_COMBINE_REDUCE_BATCH, BACKWARD_COMBINE>
     (param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.attn_to_rdma_map, param.attn_output_token, param.attn_output_prob, smem_buffer_ptr);
   }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
     // Intra-node G2S warp group.
@@ -4765,7 +4765,7 @@ template<int NUM_THREADS_PER_BLOCK,
          int NUM_OF_EXPERTS_PER_RANK,
          int TOPK = 0>  // 0 = bool routing map mode; >0 = dense topk_idx mode with this K value
 __launch_bounds__(NUM_THREADS_PER_BLOCK, 1)
-__global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or uint16_t* (TOPK>0)
+__global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int16_t* (TOPK>0)
                      tmp_state_t* tmp, 
                      tmp_state_t* local_experts_tmp, 
                      int32_t* sparse_to_dense_map, 
@@ -4786,7 +4786,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or uint
   constexpr bool DENSE_ROUTING = (TOPK > 0);
   // Cast input pointer to the correct type.
   const bool* input_routing_map = DENSE_ROUTING ? nullptr : reinterpret_cast<const bool*>(input_routing_data);
-  const uint16_t* input_topk_idx = DENSE_ROUTING ? reinterpret_cast<const uint16_t*>(input_routing_data) : nullptr;
+  const int16_t* input_topk_idx = DENSE_ROUTING ? reinterpret_cast<const int16_t*>(input_routing_data) : nullptr;
 
   // Calculate the warps per block.
   constexpr int WARP_SIZE = 32;
@@ -4815,7 +4815,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or uint
 #endif
   // For each token(row in routing map), calculate how many bytes need to be loaded from the routing map and how to load them.
   static_assert(sizeof(bool) == 1, "Bool is not 1 byte???");
-  constexpr int NUM_OF_BYTES_TO_LOAD_FOR_EACH_TOKEN = DENSE_ROUTING ? (TOPK * sizeof(uint16_t)) : (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE);
+  constexpr int NUM_OF_BYTES_TO_LOAD_FOR_EACH_TOKEN = DENSE_ROUTING ? (TOPK * sizeof(int16_t)) : (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE);
   using copy_t = Copy_t<NUM_OF_BYTES_TO_LOAD_FOR_EACH_TOKEN>;
   static_assert(NUM_OF_BYTES_TO_LOAD_FOR_EACH_TOKEN % sizeof(copy_t) == 0, "NUM_OF_BYTES_TO_LOAD_FOR_EACH_TOKEN and copy_t mismatch");
   constexpr int ROUTING_MAP_LOAD_ITER = NUM_OF_BYTES_TO_LOAD_FOR_EACH_TOKEN / sizeof(copy_t);
@@ -4928,10 +4928,11 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or uint
     }
 
     if constexpr(DENSE_ROUTING){
-      // Dense mode: load TOPK uint16 expert indices and check against rank ranges.
-      // Input layout: [num_total_tokens, TOPK] uint16_t (NOT per-node sliced — global expert IDs).
+      // Dense mode: load TOPK int16 expert indices and check against rank ranges.
+      // Input layout: [num_total_tokens, TOPK] int16_t (NOT per-node sliced — global expert IDs).
+      // Dropped tokens use -1 as sentinel (negative, so naturally excluded by range checks).
       const copy_t* topk_load_base_addr = reinterpret_cast<const copy_t*>(input_topk_idx + current_token_id * TOPK);
-      uint16_t topk_experts[TOPK];
+      int16_t topk_experts[TOPK];
       #pragma unroll
       for(int j = 0; j < ROUTING_MAP_LOAD_ITER; j++){
         *(reinterpret_cast<copy_t*>(topk_experts) + j) = topk_load_base_addr[j];
@@ -5352,7 +5353,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or uint
 #endif
 
     // Load routing data for current token (reuse for all ranks).
-    // In dense mode: load TOPK uint16 expert indices.
+    // In dense mode: load TOPK int16 expert indices.
     // In sparse mode: load E_per_rank * R_per_node bools for local node slice.
     // Also compute per-rank routing flags.
     bool token_needed_by_rank_step2[NUM_OF_RANKS_PER_NODE];
@@ -5366,7 +5367,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or uint
     if constexpr(DENSE_ROUTING){
       if(token_out_of_bound == 0){
         const copy_t* topk_load_base_addr = reinterpret_cast<const copy_t*>(input_topk_idx + current_token_id * TOPK);
-        uint16_t topk_experts[TOPK];
+        int16_t topk_experts[TOPK];
         #pragma unroll
         for(int j = 0; j < ROUTING_MAP_LOAD_ITER; j++){
           *(reinterpret_cast<copy_t*>(topk_experts) + j) = topk_load_base_addr[j];
@@ -5441,7 +5442,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or uint
               // Check if any topk index matches this local expert.
               int target_expert = node_rank * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE) + j * NUM_OF_EXPERTS_PER_RANK + k;
               // Re-load topk indices. The compiler should hoist this out of the k loop.
-              const uint16_t* topk_base = input_topk_idx + current_token_id * TOPK;
+              const int16_t* topk_base = input_topk_idx + current_token_id * TOPK;
               #pragma unroll
               for(int m = 0; m < TOPK; m++){
                 if((int)topk_base[m] == target_expert){
@@ -5488,7 +5489,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or uint
             local_expert_bools[k] = false;
           }
           // Re-load topk indices (or reuse from above if we cached them).
-          const uint16_t* topk_base = input_topk_idx + current_token_id * TOPK;
+          const int16_t* topk_base = input_topk_idx + current_token_id * TOPK;
           int local_expert_start = node_rank * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE) + local_rank * NUM_OF_EXPERTS_PER_RANK;
           #pragma unroll
           for(int k = 0; k < TOPK; k++){
@@ -5573,7 +5574,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or uint
         // Dense mode: check if any topk expert falls on current_token_node_id.
         // The global token id for this local token on the local rank.
         int global_token_id = (node_rank * NUM_OF_RANKS_PER_NODE + local_rank) * num_of_tokens_per_rank + current_token_local_id;
-        const uint16_t* topk_base = input_topk_idx + global_token_id * TOPK;
+        const int16_t* topk_base = input_topk_idx + global_token_id * TOPK;
         constexpr int EXPERTS_PER_NODE = NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE;
         int target_node_expert_start = current_token_node_id * EXPERTS_PER_NODE;
         int target_node_expert_end = target_node_expert_start + EXPERTS_PER_NODE;
@@ -5853,7 +5854,7 @@ public:
            // Number of fully in-flight S2G in unpermute reduction warp group.
            int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_UNPERMUTE_BLOCKS,
            // Number of G2S slots to accumulate per batch in the combine reduction loop.
-           int NUM_OF_COMBINE_REDUCE_BATCH_SIZE,
+           int NUM_TOKENS_COMBINE_REDUCE_BATCH,
            // Whether the combine kernel is used in backward process.
            bool BACKWARD_COMBINE,
            // Whether the combine kernel need device-side sync before launch.
@@ -5907,7 +5908,7 @@ public:
                                                     UNPERMUTE_RED_GROUP, NUM_OF_DATA_PIPELINE_PER_BLOCK, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, NUM_OF_STAGES_G2S_UNPERMUTE_BLOCK, 
                                                     NUM_OF_STAGES_S2G_UNPERMUTE_BLOCK, NUM_OF_TOKENS_PER_GROUP, NUM_OF_TOKENS_PER_CHUNK, HIDDEN_DIM, MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_EXPERTS_PER_RANK,
                                                     NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_UNPERMUTE_BLOCKS, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, 
-                                                    NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_UNPERMUTE_BLOCKS, NUM_OF_COMBINE_REDUCE_BATCH_SIZE, BACKWARD_COMBINE>;
+                                                    NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_UNPERMUTE_BLOCKS, NUM_TOKENS_COMBINE_REDUCE_BATCH, BACKWARD_COMBINE>;
 
     // Configure dynamic shared memory for the combine kernel.
 #ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE

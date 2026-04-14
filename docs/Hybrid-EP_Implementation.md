@@ -1,6 +1,7 @@
 # Hybrid-EP Implementation Guide
 
 ## Table of Contents
+
 1. [Overview](#1-overview)
 2. [Interface](#2-interface)
 3. [Config](#3-config)
@@ -20,6 +21,7 @@
 ![Hybrid-EP Workflow](../figures/hybrid-ep-img/Hybrid-EP-workflow.svg)
 
 ### Code Structure
+
 ```
 csrc/hybrid_ep/
 ├── hybrid_ep.*                    # Main HybridEPBuffer class
@@ -54,6 +56,7 @@ tests/
 ### `__init__`
 
 **Inputs:**
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `group` | `torch.distributed.ProcessGroup` | PyTorch distributed process group |
@@ -75,10 +78,12 @@ tests/
 Dispatch tokens to target experts. Use `dispatch_with_permute` for integrated permutation (see [7.2 Permutation](#72-permutation)).
 
 > **Routing Input Modes** (choose one):
+>
 > - **Index-based**: `topk_idx` + `topk_weights` + `num_of_experts`
 > - **Map-based**: `routing_map` + `probs`
 
 **Common Inputs:**
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `hidden` | `Tensor[N, D]` | Input token embeddings |
@@ -91,6 +96,7 @@ Dispatch tokens to target experts. Use `dispatch_with_permute` for integrated pe
 | `handle` | `tuple` | Cached metadata from previous call |
 
 **Additional Inputs for `dispatch_with_permute`:**
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `num_of_experts_per_rank` | `int` | Experts per rank |
@@ -102,6 +108,7 @@ Dispatch tokens to target experts. Use `dispatch_with_permute` for integrated pe
 > **Non-blocking Mode:** When `non_blocking=True`, stream synchronizations are skipped. Output buffer is sized by `num_permuted_tokens`; overflow sets `overflow_flag=True` and drops excess tokens. In non-blocking mode, `num_dispatched_tokens_tensor` and `tokens_per_expert` are GPU tensors; otherwise they reside in CPU pinned memory.
 
 **Outputs:**
+
 | Return | `dispatch` | `dispatch_with_permute` |
 |--------|------------|-------------------------|
 | `dispatched_token` | Tokens for local experts | Permuted tokens grouped by expert |
@@ -115,6 +122,7 @@ Dispatch tokens to target experts. Use `dispatch_with_permute` for integrated pe
 Combine tokens from experts back to original positions. Use corresponding method based on dispatch variant.
 
 **Inputs:**
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `hidden` | `Tensor` | Expert output embeddings |
@@ -124,6 +132,7 @@ Combine tokens from experts back to original positions. Use corresponding method
 | `fuse_unpermute_combine` | `bool` | Fuse unpermute into the combine kernel (default: False) |
 
 **Outputs:**
+
 | Return | Type | Description |
 |--------|------|-------------|
 | `combined_token` | `Tensor[N, D]` | Combined tokens in original order |
@@ -250,6 +259,7 @@ Since `max_num_of_tokens_per_rank` also determines buffer allocation size, Hybri
 ## 4. Buffer Management
 
 Hybrid-EP uses two types of coordinators to manage communication buffers:
+
 - **NVLCoordinator**: Manages intra-node communication buffers
 - **RDMACoordinator**: Manages inter-node communication buffers
 
@@ -278,11 +288,13 @@ max_num_of_tokens = max_num_of_tokens_per_rank × num_of_ranks_per_node × num_o
 ```
 
 **Intra-node buffers** (per rank):
+
 - `token_buffer`: `max_tokens × hidden_dim × sizeof(dtype)`
 - `prob_buffer`: `max_tokens × (num_of_experts_per_rank × num_of_ranks_per_node) × sizeof(float)`
 - `scaling_factor_buffer`: `max_tokens × (hidden_dim / 128) × sizeof(float)` — FP8 only
 
 **Inter-node RDMA buffers** (when `num_of_nodes > 1`, per rank):
+
 - `rdma_token_buffer`: `max_tokens_per_rank × (num_nodes - 1) × hidden_dim × sizeof(dtype)`
 - `rdma_prob_buffer`: `max_tokens_per_rank × (num_nodes - 1) × (num_of_experts_per_rank × num_of_ranks_per_node) × sizeof(float)`
 
@@ -379,6 +391,7 @@ When `fuse_permute_dispatch=True` or `fuse_unpermute_combine=True`, the `build()
 All ranks compile identical kernels, but use unique filenames (including `node_rank`, `local_rank`, and timestamp) to avoid conflicts. After compilation, `std::filesystem::rename` atomically merges them into a single cached `.so`.
 
 **Cache Directory:**
+
 - Environment variable: `HYBRID_EP_CACHE_DIR`
 - Default: `$HOME/.deepep/hybrid_ep/jit` (fallback: `/tmp/.deepep/hybrid_ep/jit`)
 
@@ -443,6 +456,7 @@ For CUDA graph capture, `non_blocking=True` allows users to provide an estimated
 ```
 
 **Output behavior**:
+
 - **Overflow** (actual > estimated): Excess tokens are dropped, `overflow_flag = True`
 - **Underflow** (actual ≤ estimated): Trailing portion contains garbage data, use `tokens_per_expert` to find valid ranges
 
@@ -457,6 +471,7 @@ The dispatch and combine kernels in Hybrid-EP are **warp-specialized persistent 
 - **Independent blocks**: Data is divided into chunks evenly distributed across blocks
 
 **Data type support:**
+
 - Dispatch kernel supports BF16 and FP8. For FP8, scaling factors are transmitted alongside tokens (one 32-bit scaling factor(4 uint8 or 1 fp32) per 128 elements)
 - Combine kernel only supports BF16
 
@@ -483,8 +498,8 @@ When `fuse_permute_dispatch=True` (compiled with `-DHYBRID_EP_BUILD_PERMUTE_FUSI
 
 Each permute block contains two warp groups:
 
-5. **Permute G2S Warp Group**: Reads dispatched tokens from per-rank NVLink buffers. Waits on chunk-ready flags (`intra_node_expert_output_chunk_flags`) set by dispatch S2G warp groups when a chunk's write to the per-rank buffer completes.
-6. **Permute S2G Warp Group**: Writes permuted tokens directly to the output tensor (`local_expert_output_token`), grouped by expert. Handles padding initialization for `pad_multiple` alignment.
+1. **Permute G2S Warp Group**: Reads dispatched tokens from per-rank NVLink buffers. Waits on chunk-ready flags (`intra_node_expert_output_chunk_flags`) set by dispatch S2G warp groups when a chunk's write to the per-rank buffer completes.
+2. **Permute S2G Warp Group**: Writes permuted tokens directly to the output tensor (`local_expert_output_token`), grouped by expert. Handles padding initialization for `pad_multiple` alignment.
 
 **Synchronization**: Dispatch S2G warp groups notify permute G2S warp groups via per-chunk flags. A monotonically increasing `expected_permute_flag_value` tracks completion across invocations without resetting the flags.
 
@@ -515,8 +530,8 @@ When `fuse_unpermute_combine=True` (compiled with `-DHYBRID_EP_BUILD_PERMUTE_FUS
 
 Each unpermute block contains two warp groups:
 
-6. **Unpermute G2S Warp Group**: Reads expert output tokens from the user's input tensor (`local_expert_input_token`) using `dense_to_expert_map` to traverse tokens in expert-grouped order. Produces token entries into the shared memory G2S FIFO with `num_of_stages_g2s_unpermute_block` pipeline depth.
-7. **Unpermute Red Warp Group**: Consumes token entries from the shared memory G2S FIFO, rearranges them from expert-grouped order to chunk-based order, and writes to the local rank's NVLink buffer (`expert_input_token[local_rank]`). Sets chunk-ready flags (`intra_node_expert_input_chunk_flags`) on all ranks after each chunk write completes, notifying combine G2S warp groups that the data is ready for reading.
+1. **Unpermute G2S Warp Group**: Reads expert output tokens from the user's input tensor (`local_expert_input_token`) using `dense_to_expert_map` to traverse tokens in expert-grouped order. Produces token entries into the shared memory G2S FIFO with `num_of_stages_g2s_unpermute_block` pipeline depth.
+2. **Unpermute Red Warp Group**: Consumes token entries from the shared memory G2S FIFO, rearranges them from expert-grouped order to chunk-based order, and writes to the local rank's NVLink buffer (`expert_input_token[local_rank]`). Sets chunk-ready flags (`intra_node_expert_input_chunk_flags`) on all ranks after each chunk write completes, notifying combine G2S warp groups that the data is ready for reading.
 
 ## 9. Allocator
 
@@ -538,6 +553,7 @@ export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8
 ```
 
 This environment variable specifies the number of ranks that can directly access each other's GPU memory within a single NVLink domain. It determines:
+
 - `local_rank = rank % NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` — rank index within the NVLink domain
 - `node_rank = rank // NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` — which NVLink domain this rank belongs to
 - `num_of_nodes = group_size // NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` — total number of NVLink domains
@@ -584,7 +600,7 @@ These optimizations target latent MoE configurations where `HIDDEN_DIM` is small
 
 **Fix:** Batch B sources together: wait for B mbarriers sequentially (typically instant since G2S pipelines all reads ahead), then a single barrier, accumulate all B sources from SMEM without interruption, then a single barrier, then batch-free all B slots. Reduces barriers from 2*N to 2*ceil(N/B) per output token.
 
-**Configuration:** Batch size is configurable via `NUM_OF_COMBINE_REDUCE_BATCH_SIZE_API` environment variable. Default: auto (half the G2S pipeline depth to allow G2S/consumer overlap). The value becomes a JIT template parameter `NUM_OF_COMBINE_REDUCE_BATCH_SIZE`.
+**Configuration:** Batch size is configurable via `NUM_TOKENS_COMBINE_REDUCE_BATCH_COMBINE_API` environment variable. Default: 1. The value becomes a JIT template parameter `NUM_TOKENS_COMBINE_REDUCE_BATCH`.
 
 **Files changed:** `hybrid_ep_backend.cuh` (inter_node_red reduction loop rewritten), `config.cuh` (new config field + env var + auto-resolution), `compiler.cu` (JIT codegen + cache key).
 
@@ -611,7 +627,7 @@ dispatched = buffer.dispatch(hidden=hidden, topk_idx=topk_idx,
 
 **Files changed:** `hybrid_ep_backend.cuh` (scan kernel Steps 0, 2, 3), `config.cuh` (topk field), `executor.cu` (allgather dtype handling), `compiler.cu` + `compiler.cuh` (JIT codegen), `pybind_hybrid_ep.cu` (config binding), `hybrid_ep_buffer.py` (Python API).
 
-**Impact:** Allgather size reduced from T * E_total to T * K * 2 bytes (32x on NVL72 with K=36). Scan kernel per-token load reduced from E*R bytes to K*2 bytes.
+**Impact:** Allgather size reduced from T *E_total to T* K * 2 bytes (32x on NVL72 with K=36). Scan kernel per-token load reduced from E*R bytes to K*2 bytes.
 
 ### 10.5 Tuning Environment Variables
 
@@ -621,7 +637,7 @@ All combine kernel parameters are configurable via environment variables and bec
 |----------|---------|-------------|
 | `NUM_OF_STAGES_G2S_COMBINE_API` | 10 | G2S SMEM pipeline stages (total, split across pipelines) |
 | `NUM_OF_STAGES_S2G_COMBINE_API` | 2 | S2G SMEM pipeline stages |
-| `NUM_OF_COMBINE_REDUCE_BATCH_SIZE_API` | 0 (auto) | Batch size for combine reduction. 0 = half pipeline depth |
+| `NUM_TOKENS_COMBINE_REDUCE_BATCH_COMBINE_API` | 1 | Batch size for combine reduction. 0 = half pipeline depth |
 | `NUM_OF_TOKENS_PER_GROUP_COMBINE_API` | 4 | Output tokens per group assigned to each pipeline |
 | `NUM_OF_TOKENS_PER_CHUNK_COMBINE_API` | 64 | Chunk size for inter-rank synchronization |
 | `NUM_SMS_COMBINE` | 24 | Number of SMs for combine kernel |
@@ -632,7 +648,7 @@ All combine kernel parameters are configurable via environment variables and bec
 
 ```bash
 NUM_OF_STAGES_G2S_COMBINE_API=64 NUM_OF_STAGES_S2G_COMBINE_API=8 \
-NUM_OF_COMBINE_REDUCE_BATCH_SIZE_API=16 NUM_OF_TOKENS_PER_GROUP_COMBINE_API=1 \
+NUM_TOKENS_COMBINE_REDUCE_BATCH_COMBINE_API=16 NUM_OF_TOKENS_PER_GROUP_COMBINE_API=1 \
 NUM_SMS_DISPATCH=32 NUM_SMS_COMBINE=64
 ```
 

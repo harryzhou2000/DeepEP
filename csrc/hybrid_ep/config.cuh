@@ -104,7 +104,7 @@ struct HybridEpConfigInstance {
   int num_of_blocks_combine_api;
   int num_of_additional_in_flight_s2g_combine_api;
   int num_of_additional_in_flight_s2g_unpermute_block_combine_api;
-  int num_of_combine_reduce_batch_size;
+  int num_tokens_combine_reduce_batch;
   bool backward_combine_api;
   bool device_side_sync_combine_api = true;
 
@@ -398,8 +398,8 @@ public:
         config.num_of_additional_in_flight_s2g_combine_api = get_env_int("NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_COMBINE_API", 2);
         config.num_of_additional_in_flight_s2g_unpermute_block_combine_api = get_env_int("NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_UNPERMUTE_BLOCK_COMBINE_API", 2);
         // Batch size for combine reduction: number of G2S slots to accumulate before barrier sync.
-        // Default 0 means use half the G2S pipeline depth (auto-tuned after adjust_template).
-        config.num_of_combine_reduce_batch_size = get_env_int("NUM_OF_COMBINE_REDUCE_BATCH_SIZE_API", 0);
+        // Default 1 (no batching). Set to 0 for auto (half the G2S pipeline depth).
+        config.num_tokens_combine_reduce_batch = get_env_int("NUM_TOKENS_COMBINE_REDUCE_BATCH_COMBINE_API", 1);
         
         config.pad_multiple = 1;
         config.topk = 0;  // default: sparse bool routing map
@@ -508,12 +508,12 @@ public:
         // NUM_OF_DATA_PIPELINE_PER_BLOCK is 2 for single-node, 1 for multi-node.
         int num_pipelines = (config.num_of_nodes > 1) ? 1 : 2;
         int stages_per_pipeline = config.num_of_stages_g2s_combine_api / num_pipelines;
-        if (config.num_of_combine_reduce_batch_size <= 0) {
+        if (config.num_tokens_combine_reduce_batch <= 0) {
             // Auto: use half the pipeline depth to allow G2S/consumer overlap.
-            config.num_of_combine_reduce_batch_size = std::max(1, stages_per_pipeline / 2);
+            config.num_tokens_combine_reduce_batch = std::max(1, stages_per_pipeline / 2);
         }
         // Clamp to pipeline depth.
-        config.num_of_combine_reduce_batch_size = std::min(config.num_of_combine_reduce_batch_size, stages_per_pipeline);
+        config.num_tokens_combine_reduce_batch = std::min(config.num_tokens_combine_reduce_batch, stages_per_pipeline);
 
         // 6. Final validation
         int64_t final_dispatch = dispatch_smem();
@@ -540,7 +540,7 @@ public:
                 config.num_of_in_flight_s2g_dispatch_api, config.num_of_tokens_per_chunk_dispatch_api,
                 config.num_of_blocks_dispatch_api,
                 config.num_of_stages_g2s_combine_api, config.num_of_stages_s2g_combine_api,
-                config.num_of_combine_reduce_batch_size,
+                config.num_tokens_combine_reduce_batch,
                 config.num_of_tokens_per_chunk_combine_api, config.num_of_tokens_per_group_combine_api,
                 config.num_of_blocks_combine_api,
                 config.num_of_stages_g2s_unpermute_block, config.num_of_stages_s2g_unpermute_block,

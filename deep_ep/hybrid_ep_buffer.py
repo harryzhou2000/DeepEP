@@ -188,8 +188,9 @@ class HybridEPBuffer:
         Backward direction:
         combine_in_backward <- local_unpermute -> expert_mlp -> local_permute -> dispatch_in_backward
 
-        When dense_routing=True, topk_idx is passed directly as uint16 (skipping indices_to_map).
+        When dense_routing=True, topk_idx is passed directly as int16 (skipping indices_to_map).
         This reduces allgather size from T*E_total to T*K*2 bytes.
+        Dropped tokens should use -1 as sentinel (naturally ignored by range checks in the kernel).
         """
         num_of_tokens, hidden_dim = hidden.shape
 
@@ -197,7 +198,6 @@ class HybridEPBuffer:
             assert topk_idx is not None, "topk_idx is required for dense_routing mode"
             assert num_of_experts is not None, "num_of_experts is required for dense_routing mode"
             topk = topk_idx.size(-1)
-            # Convert topk_idx to int16 (uint16 not natively supported in PyTorch, reinterpret)
             routing_data = topk_idx.to(torch.int16).contiguous()
             # Compute probs via scatter if topk_weights provided
             if probs is None and topk_weights is not None:
