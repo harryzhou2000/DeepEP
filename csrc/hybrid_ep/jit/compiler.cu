@@ -186,7 +186,8 @@ std::string NVCCCompiler::get_metadata_preprocessing_code(HybridEpConfigInstance
          std::to_string(config.num_of_ranks_per_node) + ", " + std::to_string(config.num_of_nodes) + ", " +
          std::to_string(config.num_of_experts_per_rank) + ">::metadata_preprocessing<" +
          std::to_string(config.pad_multiple) + ", " + std::to_string(config.num_of_tokens_per_chunk_preprocessing_api) + ", " +
-         std::to_string(config.num_of_threads_per_block_preprocessing_api) + ", " + std::to_string(config.num_of_blocks_preprocessing_api) + R"(>;
+         std::to_string(config.num_of_threads_per_block_preprocessing_api) + ", " + std::to_string(config.num_of_blocks_preprocessing_api) + ", " +
+         std::to_string(config.topk) + R"(>;
             return func_ptr;
           }
         }
@@ -290,6 +291,7 @@ void KernelCache::run_preprocess_kernel(
         config.num_of_tokens_per_chunk_preprocessing_api,
         config.num_of_threads_per_block_preprocessing_api,
         config.num_of_blocks_preprocessing_api,
+        config.topk,
         fuse_permute_dispatch,
         non_blocking
     );

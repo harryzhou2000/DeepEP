@@ -28,25 +28,31 @@ torch::Tensor Executor::allgather_routing_map(
     nvtxRangePushA("allgather_routing_map in hybrid-ep");
 
     auto torch_distributed = py::module_::import("torch.distributed");
-    auto num_of_expert = local_routing_map.size(-1);
+    auto num_cols = local_routing_map.size(-1);  // E_total (sparse) or TOPK (dense)
     auto num_of_tokens_per_rank = local_routing_map.size(-2);
     auto group_size = process_group.attr("size")().cast<int>();
-    assert(num_of_expert == config.num_of_experts_per_rank * config.num_of_ranks_per_node * config.num_of_nodes);
+    bool dense_routing = (config.topk > 0);
+    if (!dense_routing) {
+        assert(num_cols == config.num_of_experts_per_rank * config.num_of_ranks_per_node * config.num_of_nodes);
+    } else {
+        assert(num_cols == config.topk);
+    }
+    auto dtype = dense_routing ? torch::kInt16 : torch::kBool;
 
     torch::Tensor global_routing_map;
     // At inter-node case, we will use NCCL allgather
     if(config.num_of_nodes > 1 || !enable_custom_allgather) {
         global_routing_map = torch::empty(
-            {num_of_tokens_per_rank * group_size, num_of_expert},
-            torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA)
+            {num_of_tokens_per_rank * group_size, num_cols},
+            torch::TensorOptions().dtype(dtype).device(torch::kCUDA)
         );
         torch_distributed.attr("all_gather_into_tensor")(global_routing_map, local_routing_map, process_group);
     } else { // At intra-node case, we will use custom allgather
         allgather_obj.launch(local_routing_map, /*NUM_OF_SMS=*/32, at::cuda::getCurrentCUDAStream());
         global_routing_map = torch::from_blob(
             allgather_obj.get_output_buffer(), 
-            {num_of_tokens_per_rank * group_size, num_of_expert},
-            torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA)
+            {num_of_tokens_per_rank * group_size, num_cols},
+            torch::TensorOptions().dtype(dtype).device(torch::kCUDA)
         );
     }
 
@@ -133,7 +139,7 @@ HandleImpl Executor::metadata_preprocess_core(
   }
 
   kernel_cache.run_preprocess_kernel(
-      config, global_routing_map.data_ptr<bool>(), 
+      config, global_routing_map.data_ptr(), 
       preprocessing_tmp, preprocessing_local_experts_tmp,
       handle.sparse_to_dense_map.data_ptr<int32_t>(),
       handle.rdma_to_attn_map.data_ptr<bool>(), handle.attn_to_rdma_map.data_ptr<bool>(),

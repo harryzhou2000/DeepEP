@@ -168,6 +168,33 @@ def test_hybrid_ep_correctness(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, us
     if dist.get_rank() == 0:
         print('  dispatch+combine API: PASS', flush=True)
 
+    # Dense routing dispatch correctness check
+    for with_probs in [True, False]:
+        dispatched_hidden_ref, dispatched_probs_ref, dispatched_scaling_factor_ref = (
+            ref.dispatch(
+                hidden, routing_map, probs if with_probs else None, scaling_factor
+            )
+        )
+        (
+            dispatched_hidden_dense,
+            dispatched_probs_dense,
+            dispatched_scaling_factor_dense,
+            handle_dense,
+        ) = buffer.dispatch(
+            hidden=hidden, scaling_factor=scaling_factor, topk_idx=topk_idx,
+            topk_weights=topk_weights if with_probs else None, num_of_experts=NUM_OF_EXPERTS,
+            dense_routing=True,
+        )
+
+        assert bitwise_equal(dispatched_hidden_ref, dispatched_hidden_dense)
+        if dispatched_probs_dense is not None and dispatched_probs_ref is not None:
+            start, end = ref._local_expert_range_per_node()
+            assert bitwise_equal(dispatched_probs_ref, dispatched_probs_dense[:, start:end])
+
+    dist.barrier()
+    if dist.get_rank() == 0:
+        print('  dispatch+combine API (dense routing): PASS', flush=True)
+
     # Dispatch with permute correctness check
     for fuse_permute_dispatch in [False, True]:
         for with_probs in [True, False]:
