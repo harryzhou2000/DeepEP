@@ -3,29 +3,33 @@
 # See LICENSE for license information.
 
 """
-Benchmark the CuTe DSL scan kernel.
+Benchmark the CuTe DSL scan kernel with proper timing isolation.
 
-Measures kernel-only execution time (excluding compilation and allgather).
-Also benchmarks the original C++ JIT scan if run via multi-process with DeepEP.
+Reports three measurements:
+  1. Full call: metadata_preprocess_cute (includes alloc + DLPack + kernel)
+  2. Kernel-only: pre-allocated outputs, pre-converted DLPack tensors,
+     only the compiled kernel invocation is measured.
+  3. Overhead: (1) - (2), showing Python/alloc/DLPack cost per call.
 
 Usage:
-    # CuTe DSL kernel only (single GPU, no distributed):
     python tests/bench_cute_scan.py
-
-    # With original C++ JIT for comparison (needs 8 GPUs):
-    python tests/bench_cute_scan.py --with-original --num-processes 8
-
-    # Production config:
     python tests/bench_cute_scan.py --num-tokens 8192 --num-experts 32 --num-ranks 8 --topk 36
 """
 
 import argparse
-import sys
 import time
 import torch
 
 try:
-    from deep_ep.cute_kernels.scan import metadata_preprocess_cute
+    from deep_ep.cute_kernels.scan import (
+        metadata_preprocess_cute,
+        scan_kernel_cute,
+        ScanKernel,
+        _kernel_cache,
+        VEC_WIDTH,
+    )
+    from cutlass.cute.runtime import from_dlpack
+    import cutlass.cute as cute
     HAS_CUTE_DSL = True
 except ImportError as e:
     HAS_CUTE_DSL = False
@@ -33,7 +37,6 @@ except ImportError as e:
 
 
 def generate_routing_data(total_tokens, total_experts, topk, device):
-    """Generate random routing data."""
     if topk > 0:
         return torch.stack([
             torch.randperm(total_experts, device=device)[:topk]
@@ -50,9 +53,8 @@ def generate_routing_data(total_tokens, total_experts, topk, device):
 def bench_cute_scan(
     num_tokens=8192, E=32, R=8, topk=36, N=1,
     num_blocks=24, num_threads=128,
-    warmup=20, iters=100,
+    warmup=50, iters=200,
 ):
-    """Benchmark CuTe DSL scan kernel."""
     if not HAS_CUTE_DSL:
         print(f"SKIP: CuTe DSL not available: {CUTE_IMPORT_ERROR}")
         return
@@ -61,61 +63,55 @@ def bench_cute_scan(
     total_experts = E * R * N
     total_tokens = num_tokens * R * N
 
+    # Clamp blocks to SM count (matching what the kernel does)
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    if num_blocks > sm_count:
+        num_blocks = sm_count
+
     print(f"\nBenchmark: T={num_tokens}, E={E}, R={R}, K={topk}, N={N}, "
           f"blocks={num_blocks}, threads={num_threads}")
     print(f"  Total tokens: {total_tokens}, total experts: {total_experts}")
 
     routing_data = generate_routing_data(total_tokens, total_experts, topk, device)
 
-    # Warmup (includes first-time compilation)
-    print(f"  Warming up ({warmup} iters, first includes JIT compile)...")
-    t0 = time.time()
-    for i in range(warmup):
+    # ── 1. Full call (includes alloc + DLPack + kernel) ──
+    # Warmup
+    for _ in range(warmup):
         result = metadata_preprocess_cute(
             routing_data=routing_data,
             num_of_tokens_per_rank=num_tokens,
             num_of_experts_per_rank=E,
             num_of_ranks_per_node=R,
             num_of_nodes=N,
-            node_rank=0,
-            local_rank=0,
+            node_rank=0, local_rank=0,
             topk=topk,
             num_blocks=num_blocks,
             num_threads=num_threads,
         )
     torch.cuda.synchronize()
-    warmup_time = time.time() - t0
-    print(f"  Warmup done in {warmup_time:.2f}s (avg {warmup_time/warmup*1000:.1f}ms incl alloc)")
 
-    # Benchmark with CUDA events
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
-    start_event.record()
-    for i in range(iters):
+    start_ev.record()
+    for _ in range(iters):
         result = metadata_preprocess_cute(
             routing_data=routing_data,
             num_of_tokens_per_rank=num_tokens,
             num_of_experts_per_rank=E,
             num_of_ranks_per_node=R,
             num_of_nodes=N,
-            node_rank=0,
-            local_rank=0,
+            node_rank=0, local_rank=0,
             topk=topk,
             num_blocks=num_blocks,
             num_threads=num_threads,
         )
-    end_event.record()
+    end_ev.record()
     torch.cuda.synchronize()
+    full_ms = start_ev.elapsed_time(end_ev) / iters
+    print(f"  Full call:   {full_ms:.3f} ms avg")
 
-    total_ms = start_event.elapsed_time(end_event)
-    avg_ms = total_ms / iters
-    print(f"  CuTe DSL scan: {avg_ms:.3f} ms avg ({iters} iters)")
-    print(f"  num_dispatched: {result['num_dispatched_tokens'].item()}")
-
-    # Also measure kernel-only time (pre-allocate outputs to exclude alloc)
-    # Pre-allocate all output tensors
+    # ── 2. Kernel-only (pre-alloc + pre-convert, measure just compiled.__call__) ──
     rdma_pad = ((num_tokens - 1) // 16 + 1) * 16
     sparse_to_dense_map = torch.empty(
         (num_tokens * N, R), dtype=torch.int32, device=device,
@@ -129,58 +125,70 @@ def bench_cute_scan(
     )
     tmp = torch.zeros(num_blocks * R, dtype=torch.int64, device=device)
 
-    from deep_ep.cute_kernels.scan import scan_kernel_cute
+    # Pre-convert all tensors via from_dlpack (done once, not per iteration)
+    routing_flat = routing_data.reshape(-1)
+    tmp_flat = tmp.reshape(-1)
+    s2d_flat = sparse_to_dense_map.reshape(-1)
+    rdma_flat = rdma_to_attn_map.reshape(-1).view(torch.int8)
+    nd_flat = num_dispatched_tokens.reshape(-1)
+    le_flat = local_expert_routing_map.reshape(-1).view(torch.int8)
+
+    routing_ct = from_dlpack(routing_flat)
+    routing_ct.mark_layout_dynamic()
+    tmp_ct = from_dlpack(tmp_flat)
+    tmp_ct.mark_layout_dynamic()
+    s2d_ct = from_dlpack(s2d_flat)
+    s2d_ct.mark_layout_dynamic()
+    rdma_ct = from_dlpack(rdma_flat)
+    rdma_ct.mark_layout_dynamic()
+    nd_ct = from_dlpack(nd_flat)
+    nd_ct.mark_layout_dynamic()
+    le_ct = from_dlpack(le_flat)
+    le_ct.mark_layout_dynamic()
+
+    # Get the compiled kernel from cache
+    cache_key = (E, R, N, topk, num_blocks, num_threads)
+    compiled = _kernel_cache[cache_key]
 
     # Warmup kernel-only
     for _ in range(warmup):
         tmp.zero_()
-        scan_kernel_cute(
-            routing_data=routing_data,
-            tmp=tmp,
-            sparse_to_dense_map=sparse_to_dense_map,
-            rdma_to_attn_map=rdma_to_attn_map,
-            num_dispatched_tokens=num_dispatched_tokens,
-            local_expert_routing_map=local_expert_routing_map,
-            node_rank=0,
-            local_rank=0,
-            num_of_tokens_per_rank=num_tokens,
-            num_of_experts_per_rank=E,
-            num_of_ranks_per_node=R,
-            num_of_nodes=N,
-            topk=topk,
-            num_blocks=num_blocks,
-            num_threads=num_threads,
+        compiled(
+            routing_ct, tmp_ct, s2d_ct, rdma_ct, nd_ct, le_ct,
+            0, 0, num_tokens,
         )
     torch.cuda.synchronize()
 
     # Benchmark kernel-only
     torch.cuda.synchronize()
-    start_event.record()
+    start_ev.record()
     for _ in range(iters):
         tmp.zero_()
-        scan_kernel_cute(
-            routing_data=routing_data,
-            tmp=tmp,
-            sparse_to_dense_map=sparse_to_dense_map,
-            rdma_to_attn_map=rdma_to_attn_map,
-            num_dispatched_tokens=num_dispatched_tokens,
-            local_expert_routing_map=local_expert_routing_map,
-            node_rank=0,
-            local_rank=0,
-            num_of_tokens_per_rank=num_tokens,
-            num_of_experts_per_rank=E,
-            num_of_ranks_per_node=R,
-            num_of_nodes=N,
-            topk=topk,
-            num_blocks=num_blocks,
-            num_threads=num_threads,
+        compiled(
+            routing_ct, tmp_ct, s2d_ct, rdma_ct, nd_ct, le_ct,
+            0, 0, num_tokens,
         )
-    end_event.record()
+    end_ev.record()
     torch.cuda.synchronize()
+    kernel_with_zero_ms = start_ev.elapsed_time(end_ev) / iters
 
-    total_ms = start_event.elapsed_time(end_event)
-    avg_ms = total_ms / iters
-    print(f"  CuTe DSL kernel-only: {avg_ms:.3f} ms avg ({iters} iters)")
+    # ── 3. Measure tmp.zero_() alone to subtract ──
+    torch.cuda.synchronize()
+    start_ev.record()
+    for _ in range(iters):
+        tmp.zero_()
+    end_ev.record()
+    torch.cuda.synchronize()
+    zero_ms = start_ev.elapsed_time(end_ev) / iters
+
+    kernel_ms = kernel_with_zero_ms - zero_ms
+    overhead_ms = full_ms - kernel_with_zero_ms
+
+    print(f"  Kernel+zero: {kernel_with_zero_ms:.3f} ms avg")
+    print(f"  tmp.zero():  {zero_ms:.3f} ms avg")
+    print(f"  Kernel-only: {kernel_ms:.3f} ms avg")
+    print(f"  Overhead:    {overhead_ms:.3f} ms avg (alloc + DLPack + reshape)")
+    print(f"  num_dispatched: {num_dispatched_tokens.item()}")
 
 
 def main():
@@ -191,8 +199,8 @@ def main():
     parser.add_argument("--topk", type=int, default=36)
     parser.add_argument("--num-blocks", type=int, default=24)
     parser.add_argument("--num-threads", type=int, default=128)
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--warmup", type=int, default=50)
+    parser.add_argument("--iters", type=int, default=200)
     args = parser.parse_args()
 
     bench_cute_scan(
@@ -205,6 +213,19 @@ def main():
         warmup=args.warmup,
         iters=args.iters,
     )
+
+    # Also bench sparse if topk > 0
+    if args.topk > 0:
+        bench_cute_scan(
+            num_tokens=args.num_tokens,
+            E=args.num_experts,
+            R=args.num_ranks,
+            topk=0,
+            num_blocks=args.num_blocks,
+            num_threads=args.num_threads,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
 
 
 if __name__ == "__main__":

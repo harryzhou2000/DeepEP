@@ -135,12 +135,8 @@ class ScanKernel:
         NUM_THREADS: cutlass.Constexpr,
     ):
         NUM_WARPS = NUM_THREADS // WARP_SIZE
-        # SMEM layout:
-        #   warp_sums: NUM_WARPS * R int32
-        #   prev_block_sum: R int32
-        #   topk_staging: NUM_THREADS * TOPK int16 (= NUM_THREADS * TOPK * 2 bytes)
         smem_warp = (NUM_WARPS * R + R) * 4
-        smem_topk = NUM_THREADS * TOPK * 2  # int16 per element
+        smem_topk = NUM_THREADS * TOPK * 2 if TOPK > 0 else 0
         smem_size = smem_warp + smem_topk
 
         self.kernel(
@@ -202,14 +198,13 @@ class ScanKernel:
             cutlass.Int32, cute.make_layout((R,), stride=(1,)),
         )
         # Per-thread TOPK staging buffer in SMEM for dynamic indexing.
-        # Layout: [NUM_THREADS, TOPK] int16 — each thread owns a row.
-        topk_stage = smem.allocate_tensor(
-            cutlass.Int16, cute.make_layout((NUM_THREADS, TOPK), stride=(TOPK, 1)),
-        )
-
-        # Number of Int64 loads per thread to cover TOPK int16s.
-        # Each Int64 = 4 int16s. ceil(TOPK / 4) loads.
-        VEC_LOADS = (TOPK + VEC_WIDTH - 1) // VEC_WIDTH
+        # Only allocated in dense mode (TOPK > 0). In sparse mode, not needed.
+        if cutlass.const_expr(TOPK > 0):
+            topk_stage = smem.allocate_tensor(
+                cutlass.Int16, cute.make_layout((NUM_THREADS, TOPK), stride=(TOPK, 1)),
+            )
+            # Number of Int64 loads per thread to cover TOPK int16s.
+            VEC_LOADS = (TOPK + VEC_WIDTH - 1) // VEC_WIDTH
 
         # Register accumulators per rank
         token_sum = cute.make_rmem_tensor(cute.make_layout((R,)), cutlass.Int32)
