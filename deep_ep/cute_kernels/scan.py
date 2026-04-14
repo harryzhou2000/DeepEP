@@ -5,17 +5,20 @@
 """
 CuTe DSL scan kernel for hybrid-ep metadata preprocessing.
 
-Optimizations over the naive CuTe DSL version:
-  - Vectorized GMEM loads: 4 int16s per Int64 load (9 loads for TOPK=36,
-    matching C++ kernel's uint2 pattern). 4x fewer GMEM instructions.
-  - Single-pass with range_constexpr(R) inner rank loop: one pass over
-    tokens with R register accumulators.
-  - TOPK indices loaded once per token into SMEM staging buffer, reused
-    across the R inner loop and between Steps 0 and 2.
+Key optimizations:
+  - Vectorized GMEM loads: 4 int16s per Int64 load (matching C++ uint2).
+  - SMEM staging for TOPK indices (supports dynamic indexing).
+  - SMEM per-thread per-rank counters (avoids register-spill from constexpr unrolling).
+  - Dynamic range() for R and TOPK loops to keep predicate count low.
+    Only the vectorized unpack (4 iterations) uses range_constexpr.
   - Cross-block polling via atomic_exch/atomic_add (relaxed GPU scope).
   - Uint32 lane_mask for UB-free warp exclusive scan.
   - SM count clamping to prevent grid deadlock.
-  - Step 1 uses tidx<R parallel pattern (not constexpr loop).
+
+Architecture: R-pass over tokens (one pass per rank). Each pass reads TOPK
+from SMEM (loaded once), computes needed flag, does ballot+popc scan.
+The R-pass approach avoids the 18K predicate register explosion from
+constexpr(R) × TOPK unrolling, and each pass is identical code (no unroll).
 """
 
 import torch
@@ -26,8 +29,6 @@ from cutlass.cute.runtime import from_dlpack
 
 WARP_SIZE = 32
 SCAN_STATE_PRIV_SUM = 1
-
-# Number of int16s loaded per vectorized Int64 load
 VEC_WIDTH = 4
 
 
@@ -105,7 +106,7 @@ def metadata_preprocess_cute(
 
 
 class ScanKernel:
-    """Optimized CuTe DSL scan with vectorized loads and SMEM staging."""
+    """CuTe DSL scan — dynamic loops + SMEM staging to minimize register pressure."""
 
     def __init__(self, E, R, N, TOPK, NUM_BLOCKS, NUM_THREADS):
         self.E = E
@@ -135,8 +136,8 @@ class ScanKernel:
         NUM_THREADS: cutlass.Constexpr,
     ):
         NUM_WARPS = NUM_THREADS // WARP_SIZE
-        smem_warp = (NUM_WARPS * R + R) * 4
-        smem_topk = NUM_THREADS * TOPK * 2 if TOPK > 0 else 0
+        smem_warp = (NUM_WARPS * R + R) * 4  # warp_sums + prev_block_sum
+        smem_topk = NUM_THREADS * TOPK * 2 if TOPK > 0 else 0  # int16 staging
         smem_size = smem_warp + smem_topk
 
         self.kernel(
@@ -189,7 +190,7 @@ class ScanKernel:
         tokens_per_node = num_of_tokens_per_rank * R
         rdma_map_size_per_node = ((num_of_tokens_per_rank + 15) // 16) * 16
 
-        # SMEM allocation
+        # SMEM
         smem = utils.SmemAllocator()
         warp_sums = smem.allocate_tensor(
             cutlass.Int32, cute.make_layout((NUM_WARPS, R), stride=(R, 1)),
@@ -197,88 +198,93 @@ class ScanKernel:
         prev_block_sum = smem.allocate_tensor(
             cutlass.Int32, cute.make_layout((R,), stride=(1,)),
         )
-        # Per-thread TOPK staging buffer in SMEM for dynamic indexing.
-        # Only allocated in dense mode (TOPK > 0). In sparse mode, not needed.
         if cutlass.const_expr(TOPK > 0):
             topk_stage = smem.allocate_tensor(
                 cutlass.Int16, cute.make_layout((NUM_THREADS, TOPK), stride=(TOPK, 1)),
             )
-            # Number of Int64 loads per thread to cover TOPK int16s.
             VEC_LOADS = (TOPK + VEC_WIDTH - 1) // VEC_WIDTH
 
-        # Register accumulators per rank
-        token_sum = cute.make_rmem_tensor(cute.make_layout((R,)), cutlass.Int32)
-        for r in cutlass.range_constexpr(R):
-            token_sum[r] = cutlass.Int32(0)
-
         # =================================================================
-        # Step 0: Intra-block partial sums (single pass)
+        # Step 0: Intra-block partial sums
         # =================================================================
-        for ti in range(tokens_per_thread):
-            cur_token = thread_start + ti * WARP_SIZE
-            if cur_token < num_total_tokens:
-                node_start = node_rank * EXPERTS_PER_NODE
-                token_needed_by_node = cutlass.Int32(0)
+        # R-pass: one pass per rank. Each pass:
+        #   - Loads TOPK indices into SMEM staging (vectorized, once per token)
+        #   - Checks if token goes to rank r
+        #   - Warp-reduces and stores to warp_sums
+        # On the first pass (r==0), also writes rdma_to_attn_map and loads staging.
+        for r in range(R):
+            thread_count = cutlass.Int32(0)
 
-                if cutlass.const_expr(TOPK > 0):
-                    # Vectorized load: TOPK int16s via ceil(TOPK/4) Int64 loads.
-                    # Store to SMEM staging for dynamic indexing in rank loop.
-                    routing_base0 = routing_data.iterator + cur_token * TOPK
-                    for v0 in cutlass.range_constexpr(VEC_LOADS):
-                        eo0 = v0 * VEC_WIDTH
-                        if cutlass.const_expr(eo0 + VEC_WIDTH <= TOPK):
-                            pk0 = cute.arch.load(
-                                routing_base0 + eo0, cutlass.Int64,
-                            )
-                            for u0 in cutlass.range_constexpr(VEC_WIDTH):
-                                sh0 = cutlass.Int64(u0 * 16)
-                                elem0 = ((pk0 >> sh0) & cutlass.Int64(0xFFFF)).to(cutlass.Int16)
-                                topk_stage[tidx, eo0 + u0] = elem0
-                        else:
-                            for u0 in cutlass.range_constexpr(TOPK - eo0):
-                                topk_stage[tidx, eo0 + u0] = routing_data[
-                                    cur_token * TOPK + eo0 + u0
-                                ]
+            for ti in range(tokens_per_thread):
+                cur_token = thread_start + ti * WARP_SIZE
+                if cur_token < num_total_tokens:
+                    node_start = node_rank * EXPERTS_PER_NODE
+                    needed = cutlass.Int32(0)
 
-                    # Check each rank using SMEM-staged topk indices
-                    for r in cutlass.range_constexpr(R):
-                        needed = cutlass.Int32(0)
+                    if cutlass.const_expr(TOPK > 0):
+                        # Vectorized load into SMEM staging (every pass reloads
+                        # because each pass iterates over the same tokens, but
+                        # SMEM holds only the last-loaded token).
+                        routing_base = routing_data.iterator + cur_token * TOPK
+                        for v in cutlass.range_constexpr(VEC_LOADS):
+                            eo = v * VEC_WIDTH
+                            if cutlass.const_expr(eo + VEC_WIDTH <= TOPK):
+                                pk = cute.arch.load(routing_base + eo, cutlass.Int64)
+                                for u in cutlass.range_constexpr(VEC_WIDTH):
+                                    sh = cutlass.Int64(u * 16)
+                                    elem = ((pk >> sh) & cutlass.Int64(0xFFFF)).to(cutlass.Int16)
+                                    topk_stage[tidx, eo + u] = elem
+                            else:
+                                for u in cutlass.range_constexpr(TOPK - eo):
+                                    topk_stage[tidx, eo + u] = routing_data[
+                                        cur_token * TOPK + eo + u
+                                    ]
+
+                        # Check if any expert maps to rank r
                         for k in range(TOPK):
                             eid = topk_stage[tidx, k].to(cutlass.Int32)
                             if eid >= node_start:
                                 local_eid = eid - node_start
                                 if local_eid < EXPERTS_PER_NODE:
-                                    rwn = local_eid // E
-                                    if rwn == r:
+                                    if local_eid // E == r:
                                         needed = cutlass.Int32(1)
-                        if needed != cutlass.Int32(0):
-                            token_sum[r] = token_sum[r] + cutlass.Int32(1)
-                            token_needed_by_node = cutlass.Int32(1)
-                else:
-                    row_off = cur_token * (E * R * N) + node_rank * (E * R)
-                    for r in cutlass.range_constexpr(R):
-                        needed = cutlass.Int32(0)
-                        for e in cutlass.range_constexpr(E):
-                            bv = routing_data[row_off + r * E + e]
+                    else:
+                        # Sparse bool mode
+                        row_off = cur_token * (E * R * N) + node_rank * (E * R) + r * E
+                        for e in range(E):
+                            bv = routing_data[row_off + e]
                             if bv != cutlass.Int8(0):
                                 needed = cutlass.Int32(1)
-                        if needed != cutlass.Int32(0):
-                            token_sum[r] = token_sum[r] + cutlass.Int32(1)
-                            token_needed_by_node = cutlass.Int32(1)
 
-                # Write rdma_to_attn_map
-                cur_node_rank = cur_token // tokens_per_node
-                cur_rem = cur_token % tokens_per_node
-                cur_local_rank = cur_rem // num_of_tokens_per_rank
-                cur_local_id = cur_rem % num_of_tokens_per_rank
-                if cur_local_rank == local_rank:
-                    rdma_off = cur_node_rank * rdma_map_size_per_node + cur_local_id
-                    if rdma_off < cute.size(rdma_map):
-                        rdma_map[rdma_off] = token_needed_by_node.to(cutlass.Int8)
+                    thread_count = thread_count + needed
 
-        # Warp reduction + store to SMEM
-        for r in cutlass.range_constexpr(R):
-            warp_total_r = cute.arch.warp_reduction_sum(token_sum[r])
+                    # Write rdma_to_attn_map on first rank pass only
+                    if r == 0:
+                        # Compute node-needed: any rank on local node wants this token
+                        node_needed = cutlass.Int32(0)
+                        if cutlass.const_expr(TOPK > 0):
+                            for kk in range(TOPK):
+                                eid2 = topk_stage[tidx, kk].to(cutlass.Int32)
+                                if eid2 >= node_start:
+                                    if eid2 - node_start < EXPERTS_PER_NODE:
+                                        node_needed = cutlass.Int32(1)
+                        else:
+                            row_off2 = cur_token * (E * R * N) + node_rank * (E * R)
+                            for j2 in range(R):
+                                for e2 in range(E):
+                                    bv2 = routing_data[row_off2 + j2 * E + e2]
+                                    if bv2 != cutlass.Int8(0):
+                                        node_needed = cutlass.Int32(1)
+                        cur_node_rank = cur_token // tokens_per_node
+                        cur_rem0 = cur_token % tokens_per_node
+                        cur_local_rank = cur_rem0 // num_of_tokens_per_rank
+                        cur_local_id = cur_rem0 % num_of_tokens_per_rank
+                        if cur_local_rank == local_rank:
+                            rdma_off = cur_node_rank * rdma_map_size_per_node + cur_local_id
+                            if rdma_off < cute.size(rdma_map):
+                                rdma_map[rdma_off] = node_needed.to(cutlass.Int8)
+
+            warp_total_r = cute.arch.warp_reduction_sum(thread_count)
             if lane_id == 0:
                 warp_sums[warp_id, r] = warp_total_r
 
@@ -316,71 +322,56 @@ class ScanKernel:
         cute.arch.sync_threads()
 
         # =================================================================
-        # Step 2: Final scan (single pass, constexpr R inner loop)
+        # Step 2: Final scan (R-pass, reloads TOPK from GMEM each pass)
         # =================================================================
         lane_mask = (cutlass.Uint32(1) << lane_id.to(cutlass.Uint32)) - cutlass.Uint32(1)
 
-        prev_token_sum = cute.make_rmem_tensor(cute.make_layout((R,)), cutlass.Int32)
-        for r in cutlass.range_constexpr(R):
+        for r in range(R):
+            # Prefix for this warp
             acc = prev_block_sum[r]
             for w in range(warp_id):
                 acc = acc + warp_sums[w, r]
-            prev_token_sum[r] = acc
+            prev_sum_r = acc
 
-        for ti in range(tokens_per_thread):
-            cur_token = thread_start + ti * WARP_SIZE
-            token_oob = cutlass.Int32(1)
-            if cur_token < num_total_tokens:
-                token_oob = cutlass.Int32(0)
+            for ti in range(tokens_per_thread):
+                cur_token = thread_start + ti * WARP_SIZE
+                token_oob = cutlass.Int32(1)
+                if cur_token < num_total_tokens:
+                    token_oob = cutlass.Int32(0)
 
-            all_oob = cute.arch.vote_ballot_sync(token_oob != cutlass.Int32(0))
-            if all_oob != 0xFFFFFFFF:
-                cur_node_rank = cur_token // tokens_per_node
-                cur_rem = cur_token % tokens_per_node
-                cur_lr = cur_rem // num_of_tokens_per_rank
-                cur_lid = cur_rem % num_of_tokens_per_rank
-
-                node_start = node_rank * EXPERTS_PER_NODE
-
-                if cutlass.const_expr(TOPK > 0):
-                    # Vectorized reload into SMEM staging.
-                    # Fill with -1 first (handles OOB threads uniformly),
-                    # then overwrite with real data for in-bounds threads.
-                    for k_init in range(TOPK):
-                        topk_stage[tidx, k_init] = cutlass.Int16(-1)
-                    if token_oob == cutlass.Int32(0):
-                        routing_base2 = routing_data.iterator + cur_token * TOPK
-                        for v in cutlass.range_constexpr(VEC_LOADS):
-                            eo = v * VEC_WIDTH
-                            if cutlass.const_expr(eo + VEC_WIDTH <= TOPK):
-                                pk = cute.arch.load(
-                                    routing_base2 + eo, cutlass.Int64,
-                                )
-                                for u in cutlass.range_constexpr(VEC_WIDTH):
-                                    sh = cutlass.Int64(u * 16)
-                                    elem = ((pk >> sh) & cutlass.Int64(0xFFFF)).to(cutlass.Int16)
-                                    topk_stage[tidx, eo + u] = elem
-                            else:
-                                for u in cutlass.range_constexpr(TOPK - eo):
-                                    topk_stage[tidx, eo + u] = routing_data[
-                                        cur_token * TOPK + eo + u
-                                    ]
-
-                for r in cutlass.range_constexpr(R):
+                all_oob = cute.arch.vote_ballot_sync(token_oob != cutlass.Int32(0))
+                if all_oob != 0xFFFFFFFF:
+                    node_start = node_rank * EXPERTS_PER_NODE
                     needed = cutlass.Int32(0)
+
                     if token_oob == cutlass.Int32(0):
                         if cutlass.const_expr(TOPK > 0):
+                            # Reload into SMEM staging (vectorized)
+                            routing_base2 = routing_data.iterator + cur_token * TOPK
+                            for v2 in cutlass.range_constexpr(VEC_LOADS):
+                                eo2 = v2 * VEC_WIDTH
+                                if cutlass.const_expr(eo2 + VEC_WIDTH <= TOPK):
+                                    pk2 = cute.arch.load(routing_base2 + eo2, cutlass.Int64)
+                                    for u2 in cutlass.range_constexpr(VEC_WIDTH):
+                                        sh2 = cutlass.Int64(u2 * 16)
+                                        elem2 = ((pk2 >> sh2) & cutlass.Int64(0xFFFF)).to(cutlass.Int16)
+                                        topk_stage[tidx, eo2 + u2] = elem2
+                                else:
+                                    for u2 in cutlass.range_constexpr(TOPK - eo2):
+                                        topk_stage[tidx, eo2 + u2] = routing_data[
+                                            cur_token * TOPK + eo2 + u2
+                                        ]
+
                             for k in range(TOPK):
                                 eid = topk_stage[tidx, k].to(cutlass.Int32)
                                 if eid >= node_start:
                                     local_eid = eid - node_start
                                     if local_eid < EXPERTS_PER_NODE:
-                                        rwn = local_eid // E
-                                        if rwn == r:
+                                        if local_eid // E == r:
                                             needed = cutlass.Int32(1)
                         else:
                             row_off = cur_token * (E * R * N) + node_rank * (E * R) + r * E
-                            for e in cutlass.range_constexpr(E):
+                            for e in range(E):
                                 bv = routing_data[row_off + e]
                                 if bv != cutlass.Int8(0):
                                     needed = cutlass.Int32(1)
@@ -389,40 +380,42 @@ class ScanKernel:
                     tile_sum = cute.arch.popc(vote)
                     ex_scan = cute.arch.popc(vote.to(cutlass.Uint32) & lane_mask).to(cutlass.Int32)
 
-                    final_pos = prev_token_sum[r] + ex_scan
+                    final_pos = prev_sum_r + ex_scan
                     if needed == cutlass.Int32(0):
                         final_pos = cutlass.Int32(-1)
 
                     if token_oob == cutlass.Int32(0):
+                        cur_node_rank = cur_token // tokens_per_node
+                        cur_rem = cur_token % tokens_per_node
+                        cur_lr = cur_rem // num_of_tokens_per_rank
+                        cur_lid = cur_rem % num_of_tokens_per_rank
+
                         if cur_lr == local_rank:
                             s2d_off = (cur_node_rank * num_of_tokens_per_rank + cur_lid) * R + r
                             s2d_map[s2d_off] = final_pos
 
+                        # Write local_expert_routing_map
                         if r == local_rank:
                             if needed != cutlass.Int32(0):
                                 if cutlass.const_expr(TOPK > 0):
                                     ns = node_rank * EXPERTS_PER_NODE + local_rank * E
-                                    for e in cutlass.range_constexpr(E):
+                                    for e in range(E):
                                         expert_found = cutlass.Int8(0)
-                                        target_expert = ns + e
                                         for kk in range(TOPK):
                                             eid3 = topk_stage[tidx, kk].to(cutlass.Int32)
-                                            if eid3 == target_expert:
+                                            if eid3 == ns + e:
                                                 expert_found = cutlass.Int8(1)
-                                        le_off = final_pos * E + e
-                                        local_expert_map[le_off] = expert_found
+                                        local_expert_map[final_pos * E + e] = expert_found
                                 else:
                                     row_off3 = cur_token * (E * R * N) + node_rank * (E * R) + local_rank * E
-                                    for e in cutlass.range_constexpr(E):
-                                        bv3 = routing_data[row_off3 + e]
-                                        le_off = final_pos * E + e
-                                        local_expert_map[le_off] = bv3
+                                    for e in range(E):
+                                        local_expert_map[final_pos * E + e] = routing_data[row_off3 + e]
 
                         if cur_token == num_total_tokens - 1:
                             if r == local_rank:
-                                num_dispatched[0] = prev_token_sum[r] + tile_sum
+                                num_dispatched[0] = prev_sum_r + tile_sum
 
-                    prev_token_sum[r] = prev_token_sum[r] + tile_sum
+                    prev_sum_r = prev_sum_r + tile_sum
 
 
 # ---------------------------------------------------------------------------
