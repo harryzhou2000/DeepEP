@@ -3127,6 +3127,7 @@ template<typename SMEM_TYPE,
          int NUM_OF_NODES,
          int NUM_OF_BLOCKS,
          int NUM_OF_TOKENS_PER_GROUP,
+         int NUM_OF_COMBINE_REDUCE_BATCH_SIZE,
          bool BACKWARD_COMBINE>
 inline __device__ void inter_node_red_warp_group_device_function(const int node_rank,
                                                                  const int num_of_tokens_per_rank,
@@ -3252,73 +3253,131 @@ inline __device__ void inter_node_red_warp_group_device_function(const int node_
         bool token_needed_by_this_node = rdma_to_attn_map_load_base_addr[current_token_id];
         // If this dst token is needed by this node, load the local src token from shared memory and accumulate them.
         if(token_needed_by_this_node){
-          // End reduction group flag.
+          // Batched accumulation: wait for up to B mbarriers, barrier once, accumulate all B,
+          // barrier once, free all B. Reduces barriers from 2*N to 2*ceil(N/B) per output token.
+          constexpr int BATCH_SIZE = NUM_OF_COMBINE_REDUCE_BATCH_SIZE;
           bool last_local_node_src_token = false;
-          
-          // Continue loading local src token for this dst token and reduce them to accumulator until all local src token for this dst token have been accumulated.
-          do{
-            // Base address for current token and prob(optional) in shared memory.
-            __nv_bfloat162* load_token_base_ptr = reinterpret_cast<__nv_bfloat162*>(&smem_buffer_ptr->inter_node_token_G2S_buffer[token_stage][0]);
-            float* load_prob_base_ptr;
-            if constexpr(BACKWARD_COMBINE){
-              load_prob_base_ptr = &smem_buffer_ptr->inter_node_prob_G2S_buffer[token_stage][0];
-            }
 
-            // Wait until current src token ready in shared memory.
+          do {
+            // Phase 1: Elected thread waits for up to BATCH_SIZE mbarriers.
+            // Stages are always consecutive from token_stage.
+            int batch_first_stage = token_stage;
+            int batch_first_parity = token_producer_parity;
+
             if(warp_rank_within_pipeline == 0){
               if(elect_sync(~0)){
-                while(!cuda::ptx::mbarrier_try_wait_parity(&smem_buffer_ptr->inter_node_mbarrier_G2S_buffer[token_stage][0], token_producer_parity)){}
+                int probe_stage = token_stage;
+                int probe_parity = token_producer_parity;
+                bool found_last = false;
+
+                for(int b = 0; b < BATCH_SIZE && !found_last; b++){
+                  while(!cuda::ptx::mbarrier_try_wait_parity(&smem_buffer_ptr->inter_node_mbarrier_G2S_buffer[probe_stage][0], probe_parity)){}
+
+                  if(smem_buffer_ptr->inter_node_flag_G2S_buffer[probe_stage]){
+                    found_last = true;
+                  }
+
+                  probe_stage += 1;
+                  if(probe_stage == ending_G2S_index){
+                    probe_stage = starting_G2S_index;
+                    probe_parity ^= 1;
+                  }
+                }
+                // batch_count_local is only known to the elected thread.
+                // All threads will derive batch_count from flags after the barrier below.
               }
             }
+
+            // After the barrier, all threads can read the flags in SMEM to determine batch_count.
+            // The flags are valid (written by G2S before mbarrier arrive, TMA completed).
             arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
 
-            // Accumulate token and prob(optional).
-            #pragma unroll
-            for(int n = 0; n < NUM_OF_ELEMENT_PER_THREAD; n++){
-              int element_id = (n * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
-              if(element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN){
-                __nv_bfloat162 src_data = load_token_base_ptr[element_id];
-                float2 src_data_fp32 = __bfloat1622float2(src_data);
-                acc_token_fp32[n].x += src_data_fp32.x;
-                acc_token_fp32[n].y += src_data_fp32.y;
-              }     
-            }
-
-            if constexpr(BACKWARD_COMBINE){
-              // Sparse prob optimization: SMEM only has E_per_rank elements for the source rank's slice.
-              // Read the source rank ID and accumulate into the correct position in acc_prob[0].
-              int src_rank = smem_buffer_ptr->inter_node_prob_src_rank_G2S_buffer[token_stage];
-              int prob_offset = src_rank * NUM_OF_EXPERTS_PER_RANK;
-              #pragma unroll
-              for(int n = 0; n < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; n++){
-                int global_element_id = thread_rank_within_pipeline + n * NUM_OF_THREADS_PER_PIPELINE;
-                int local_element_id = global_element_id - prob_offset;
-                if(local_element_id >= 0 && local_element_id < NUM_OF_EXPERTS_PER_RANK){
-                  acc_prob[0][n] += load_prob_base_ptr[local_element_id];
+            // Phase 2: All threads determine batch_count by reading flags.
+            // Flags are in consecutive stages starting from batch_first_stage.
+            int batch_count = 0;
+            {
+              int scan_stage = batch_first_stage;
+              for(int b = 0; b < BATCH_SIZE; b++){
+                batch_count++;
+                if(smem_buffer_ptr->inter_node_flag_G2S_buffer[scan_stage]){
+                  break;
+                }
+                scan_stage += 1;
+                if(scan_stage == ending_G2S_index){
+                  scan_stage = starting_G2S_index;
                 }
               }
             }
 
-            // Check flag for last src token.
-            last_local_node_src_token = smem_buffer_ptr->inter_node_flag_G2S_buffer[token_stage];
+            // Phase 3: Accumulate all batch_count sources from SMEM (no barriers between them).
+            {
+              int acc_stage = batch_first_stage;
+              for(int b = 0; b < batch_count; b++){
+                __nv_bfloat162* load_token_base_ptr = reinterpret_cast<__nv_bfloat162*>(&smem_buffer_ptr->inter_node_token_G2S_buffer[acc_stage][0]);
 
-            // Make sure all threads within the pipeline have finished loading the token entry and accumulate it to the register accumulator.
-            // Then notify the producer warp to load next token entry to the shared memory as the shared memory can be reused.
+                #pragma unroll
+                for(int n = 0; n < NUM_OF_ELEMENT_PER_THREAD; n++){
+                  int element_id = (n * NUM_OF_THREADS_PER_PIPELINE) + thread_rank_within_pipeline;
+                  if(element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN){
+                    __nv_bfloat162 src_data = load_token_base_ptr[element_id];
+                    float2 src_data_fp32 = __bfloat1622float2(src_data);
+                    acc_token_fp32[n].x += src_data_fp32.x;
+                    acc_token_fp32[n].y += src_data_fp32.y;
+                  }
+                }
+
+                if constexpr(BACKWARD_COMBINE){
+                  float* load_prob_base_ptr = &smem_buffer_ptr->inter_node_prob_G2S_buffer[acc_stage][0];
+                  int src_rank = smem_buffer_ptr->inter_node_prob_src_rank_G2S_buffer[acc_stage];
+                  int prob_offset = src_rank * NUM_OF_EXPERTS_PER_RANK;
+                  #pragma unroll
+                  for(int n = 0; n < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; n++){
+                    int global_element_id = thread_rank_within_pipeline + n * NUM_OF_THREADS_PER_PIPELINE;
+                    int local_element_id = global_element_id - prob_offset;
+                    if(local_element_id >= 0 && local_element_id < NUM_OF_EXPERTS_PER_RANK){
+                      acc_prob[0][n] += load_prob_base_ptr[local_element_id];
+                    }
+                  }
+                }
+
+                if(smem_buffer_ptr->inter_node_flag_G2S_buffer[acc_stage]){
+                  last_local_node_src_token = true;
+                }
+
+                acc_stage += 1;
+                if(acc_stage == ending_G2S_index){
+                  acc_stage = starting_G2S_index;
+                }
+              }
+            }
+
+            // Phase 4: Barrier to ensure all threads done reading, then batch-free all slots.
             arrive_and_wait(NUM_OF_THREADS_PER_PIPELINE, 2 + pipeline_rank);
             if(warp_rank_within_pipeline == 0){
               if(elect_sync(~0)){
-                cuda::ptx::mbarrier_arrive(&smem_buffer_ptr->inter_node_mbarrier_G2S_buffer[token_stage][1]);
+                int free_stage = batch_first_stage;
+                for(int b = 0; b < batch_count; b++){
+                  cuda::ptx::mbarrier_arrive(&smem_buffer_ptr->inter_node_mbarrier_G2S_buffer[free_stage][1]);
+                  free_stage += 1;
+                  if(free_stage == ending_G2S_index){
+                    free_stage = starting_G2S_index;
+                  }
+                }
               }
             }
-            
-            // Goto next src token entry.
-            token_stage += 1;
-            if(token_stage == ending_G2S_index){
-              token_stage = starting_G2S_index;
-              token_producer_parity ^= 1;
+
+            // Advance token_stage past the batch.
+            token_stage = batch_first_stage;
+            token_producer_parity = batch_first_parity;
+            for(int b = 0; b < batch_count; b++){
+              token_stage += 1;
+              if(token_stage == ending_G2S_index){
+                token_stage = starting_G2S_index;
+                token_producer_parity ^= 1;
+              }
             }
 
-          }while(!last_local_node_src_token);
+          } while(!last_local_node_src_token);
         }
 
         // Then accumulate from rdma inter-node buffers. There are total NUM_OF_NODES - 1 (possible) src tokens from rdma buffer to reduce.
@@ -4449,6 +4508,8 @@ template<// This type represent intra-node reduction warp group.
          int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, 
          // Number of fully in-flight S2G in unpermute reduction warp group.
          int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_UNPERMUTE_BLOCKS,
+         // Number of G2S slots to accumulate per batch in the combine reduction loop.
+         int NUM_OF_COMBINE_REDUCE_BATCH_SIZE,
          // Whether the combine kernel is used in backward process. If so, need to transfer the prob for each token as well.
          bool BACKWARD_COMBINE>
 // Each CUDA block of combine kernel has 5 warp groups and has the following layout: 
@@ -4588,7 +4649,7 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t pa
       // Inter-node reduction warp group.
       inter_node_red_warp_group_device_function
       <cur_smem_t, INTER_NODE_RED_GROUP, NUM_OF_DATA_PIPELINE_PER_BLOCK, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_EXPERTS_PER_RANK,
-      NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE>
+      NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, NUM_OF_COMBINE_REDUCE_BATCH_SIZE, BACKWARD_COMBINE>
       (param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.attn_to_rdma_map, param.attn_output_token, param.attn_output_prob, smem_buffer_ptr);
     }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
       // Intra-node G2S warp group.
@@ -4653,7 +4714,7 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t pa
     // Inter-node reduction warp group.
     inter_node_red_warp_group_device_function
     <cur_smem_t, INTER_NODE_RED_GROUP, NUM_OF_DATA_PIPELINE_PER_BLOCK, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_EXPERTS_PER_RANK,
-    NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE>
+    NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_TOKENS_PER_GROUP, NUM_OF_COMBINE_REDUCE_BATCH_SIZE, BACKWARD_COMBINE>
     (param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.attn_to_rdma_map, param.attn_output_token, param.attn_output_prob, smem_buffer_ptr);
   }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
     // Intra-node G2S warp group.
@@ -5671,6 +5732,8 @@ public:
            int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
            // Number of fully in-flight S2G in unpermute reduction warp group.
            int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_UNPERMUTE_BLOCKS,
+           // Number of G2S slots to accumulate per batch in the combine reduction loop.
+           int NUM_OF_COMBINE_REDUCE_BATCH_SIZE,
            // Whether the combine kernel is used in backward process.
            bool BACKWARD_COMBINE,
            // Whether the combine kernel need device-side sync before launch.
@@ -5721,10 +5784,10 @@ public:
 #endif
     // The combine kernel to be launched.
     const auto combine_kernel_ptr = combine_kernel<INTRA_NODE_RED_GROUP, INTER_NODE_RED_GROUP, INTRA_NODE_G2S_GROUP, INTER_NODE_G2S_GROUP, INTER_NODE_RDMA_GROUP, UNPERMUTE_G2S_GROUP, 
-                                                   UNPERMUTE_RED_GROUP, NUM_OF_DATA_PIPELINE_PER_BLOCK, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, NUM_OF_STAGES_G2S_UNPERMUTE_BLOCK, 
-                                                   NUM_OF_STAGES_S2G_UNPERMUTE_BLOCK, NUM_OF_TOKENS_PER_GROUP, NUM_OF_TOKENS_PER_CHUNK, HIDDEN_DIM, MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_EXPERTS_PER_RANK,
-                                                   NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_UNPERMUTE_BLOCKS, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, 
-                                                   NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_UNPERMUTE_BLOCKS, BACKWARD_COMBINE>;
+                                                    UNPERMUTE_RED_GROUP, NUM_OF_DATA_PIPELINE_PER_BLOCK, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, NUM_OF_STAGES_G2S_UNPERMUTE_BLOCK, 
+                                                    NUM_OF_STAGES_S2G_UNPERMUTE_BLOCK, NUM_OF_TOKENS_PER_GROUP, NUM_OF_TOKENS_PER_CHUNK, HIDDEN_DIM, MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_EXPERTS_PER_RANK,
+                                                    NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_UNPERMUTE_BLOCKS, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, 
+                                                    NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_UNPERMUTE_BLOCKS, NUM_OF_COMBINE_REDUCE_BATCH_SIZE, BACKWARD_COMBINE>;
 
     // Configure dynamic shared memory for the combine kernel.
 #ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE

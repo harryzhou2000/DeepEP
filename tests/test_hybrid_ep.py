@@ -463,6 +463,13 @@ def test_hybrid_ep_benchmark(buffer: deep_ep.HybridEPBuffer, group: dist.Process
 def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     _, _, group = init_dist(local_rank, num_local_ranks)
 
+    # When running under ncu, set long timeout to avoid NCCL timeouts during kernel replay
+    if os.environ.get('DEEP_EP_NCU_MODE') == '1':
+        if hasattr(dist, 'distributed_c10d'):
+            # Set a very long timeout (30 min) for all process groups
+            import datetime
+            torch.distributed.distributed_c10d._get_default_timeout = lambda *a, **kw: datetime.timedelta(minutes=30)
+
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         for use_fp8 in [False]:
@@ -496,7 +503,8 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             )
 
             test_hybrid_ep_correctness(buffer, ref, use_fp8)
-            test_hybrid_ep_benchmark(buffer, group, use_fp8, args.nsys_profile)
+            if os.environ.get('DEEP_EP_NCU_MODE') != '1':
+                test_hybrid_ep_benchmark(buffer, group, use_fp8, args.nsys_profile)
     dist.barrier()
     dist.destroy_process_group()
 
@@ -506,5 +514,54 @@ if __name__ == "__main__":
                        help='Number of processes to spawn (default: 4)')
     parser.add_argument('--nsys-profile', action='store_true', default=False,
                        help='benchmark with nsys profile or not (default: False)')
+    parser.add_argument('--local-rank', type=int, default=None,
+                       help='Run as a single process with the given local rank')
+    parser.add_argument('--ncu-profile', type=str, default=None, metavar='OUTPUT_PATH',
+                       help='Profile with ncu, saving report to OUTPUT_PATH. '
+                            'Re-launches self under ncu with --target-processes all.')
+    parser.add_argument('--ncu-kernel', type=str, default='combine_kernel',
+                       help='Kernel name regex for ncu (default: combine_kernel)')
+    parser.add_argument('--ncu-metrics', type=str, default=None,
+                       help='Comma-separated ncu metrics (default: stall breakdown)')
+    parser.add_argument('--ncu-child', action='store_true', default=False,
+                       help=argparse.SUPPRESS)  # Internal flag: we are already running under ncu
     args = parser.parse_args()
-    torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)
+
+    if args.ncu_profile is not None and not args.ncu_child:
+        # Re-exec ourselves under ncu with --target-processes all
+        import subprocess, sys
+        ncu_metrics = args.ncu_metrics or ','.join([
+            'sm__warps_active.avg.pct_of_peak_sustained_active',
+            'smsp__warp_issue_stalled_barrier_per_warp_active.pct',
+            'smsp__warp_issue_stalled_membar_per_warp_active.pct',
+            'smsp__warp_issue_stalled_wait_per_warp_active.pct',
+            'smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct',
+            'smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct',
+            'smsp__warp_issue_stalled_not_selected_per_warp_active.pct',
+            'smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct',
+            'smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct',
+            'smsp__warp_issue_stalled_misc_per_warp_active.pct',
+            'gpu__time_duration.sum',
+        ])
+        ncu_cmd = [
+            'ncu',
+            '--target-processes', 'all',
+            '--kernel-name', args.ncu_kernel,
+            '--launch-skip', '0', '--launch-count', '1',
+            '--metrics', ncu_metrics,
+            '-o', args.ncu_profile, '-f',
+            sys.executable, __file__,
+            '--num-processes', str(args.num_processes),
+            '--ncu-child',
+        ]
+        print(f'[ncu-launcher] Running: {" ".join(ncu_cmd[:10])}...', flush=True)
+        rc = subprocess.call(ncu_cmd)
+        sys.exit(rc)
+    elif args.local_rank is not None:
+        # Single-process mode
+        test_main(args.local_rank, args.num_processes, args)
+    else:
+        # Multi-process mode (normal or under ncu via --ncu-child)
+        if args.ncu_child:
+            os.environ['DEEP_EP_NCU_MODE'] = '1'
+        torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)

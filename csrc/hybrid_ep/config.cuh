@@ -103,6 +103,7 @@ struct HybridEpConfigInstance {
   int num_of_blocks_combine_api;
   int num_of_additional_in_flight_s2g_combine_api;
   int num_of_additional_in_flight_s2g_unpermute_block_combine_api;
+  int num_of_combine_reduce_batch_size;
   bool backward_combine_api;
   bool device_side_sync_combine_api = true;
 
@@ -395,6 +396,9 @@ public:
         config.num_of_tokens_per_group_combine_api = get_env_int("NUM_OF_TOKENS_PER_GROUP_COMBINE_API", 4);
         config.num_of_additional_in_flight_s2g_combine_api = get_env_int("NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_COMBINE_API", 2);
         config.num_of_additional_in_flight_s2g_unpermute_block_combine_api = get_env_int("NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_UNPERMUTE_BLOCK_COMBINE_API", 2);
+        // Batch size for combine reduction: number of G2S slots to accumulate before barrier sync.
+        // Default 0 means use half the G2S pipeline depth (auto-tuned after adjust_template).
+        config.num_of_combine_reduce_batch_size = get_env_int("NUM_OF_COMBINE_REDUCE_BATCH_SIZE_API", 0);
         
         config.pad_multiple = 1;
 
@@ -498,7 +502,18 @@ public:
                         config.num_of_stages_s2g_unpermute_block);
         }
 
-        // 5. Final validation
+        // 5. Resolve combine reduce batch size.
+        // NUM_OF_DATA_PIPELINE_PER_BLOCK is 2 for single-node, 1 for multi-node.
+        int num_pipelines = (config.num_of_nodes > 1) ? 1 : 2;
+        int stages_per_pipeline = config.num_of_stages_g2s_combine_api / num_pipelines;
+        if (config.num_of_combine_reduce_batch_size <= 0) {
+            // Auto: use half the pipeline depth to allow G2S/consumer overlap.
+            config.num_of_combine_reduce_batch_size = std::max(1, stages_per_pipeline / 2);
+        }
+        // Clamp to pipeline depth.
+        config.num_of_combine_reduce_batch_size = std::min(config.num_of_combine_reduce_batch_size, stages_per_pipeline);
+
+        // 6. Final validation
         int64_t final_dispatch = dispatch_smem();
         int64_t final_combine = combine_smem();
         if (final_dispatch > max_smem || final_combine > max_smem) {
@@ -506,6 +521,30 @@ public:
                     " dispatch=%ld, combine=%ld\n", max_smem, (long)final_dispatch, (long)final_combine);
             fflush(stderr);
             throw std::runtime_error("Cannot fit kernels into shared memory even with minimum stages.");
+        }
+
+        // 7. Print final config if requested.
+        if (get_env_int("HYBRID_EP_DEBUG_JIT_CONFIG", 0)) {
+            char buf[1024];
+            snprintf(buf, sizeof(buf),
+                "[hybrid-ep config] H=%d, E=%d, R=%d, N=%d, max_tokens=%d\n"
+                "  dispatch: stages=%d, permute_stages=%d, in_flight_s2g=%d, chunk=%d, blocks=%d\n"
+                "  combine:  g2s_stages=%d, s2g_stages=%d, reduce_batch=%d, chunk=%d, group=%d, blocks=%d\n"
+                "  combine unpermute: g2s_stages=%d, s2g_stages=%d\n"
+                "  smem: dispatch=%ld B, combine=%ld B, device_max=%d B\n",
+                config.hidden_dim, config.num_of_experts_per_rank, config.num_of_ranks_per_node,
+                config.num_of_nodes, config.max_num_of_tokens_per_rank,
+                config.num_of_stages_dispatch_api, config.num_of_stages_permute_block_dispatch_api,
+                config.num_of_in_flight_s2g_dispatch_api, config.num_of_tokens_per_chunk_dispatch_api,
+                config.num_of_blocks_dispatch_api,
+                config.num_of_stages_g2s_combine_api, config.num_of_stages_s2g_combine_api,
+                config.num_of_combine_reduce_batch_size,
+                config.num_of_tokens_per_chunk_combine_api, config.num_of_tokens_per_group_combine_api,
+                config.num_of_blocks_combine_api,
+                config.num_of_stages_g2s_unpermute_block, config.num_of_stages_s2g_unpermute_block,
+                (long)final_dispatch, (long)final_combine, max_smem);
+            fprintf(stderr, "%s", buf);
+            fflush(stderr);
         }
     }
 };
