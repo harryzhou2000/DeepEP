@@ -46,7 +46,15 @@ torch::Tensor Executor::allgather_routing_map(
             {num_of_tokens_per_rank * group_size, num_cols},
             torch::TensorOptions().dtype(dtype).device(torch::kCUDA)
         );
-        torch_distributed.attr("all_gather_into_tensor")(global_routing_map, local_routing_map, process_group);
+        if (dense_routing) {
+            // NCCL does not support int16 directly. View as int8 for the allgather,
+            // then the result is reinterpreted back as int16 via global_routing_map.
+            auto local_as_bytes = local_routing_map.view(torch::kInt8);
+            auto global_as_bytes = global_routing_map.view(torch::kInt8);
+            torch_distributed.attr("all_gather_into_tensor")(global_as_bytes, local_as_bytes, process_group);
+        } else {
+            torch_distributed.attr("all_gather_into_tensor")(global_routing_map, local_routing_map, process_group);
+        }
     } else { // At intra-node case, we will use custom allgather
         allgather_obj.launch(local_routing_map, /*NUM_OF_SMS=*/32, at::cuda::getCurrentCUDAStream());
         global_routing_map = torch::from_blob(
