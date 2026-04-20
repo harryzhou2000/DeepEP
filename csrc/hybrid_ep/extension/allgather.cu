@@ -2,10 +2,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 #include "allgather.cuh"
+#include <cuda/ptx>
 
 #define MAX_BLOCKS 256
 #define TIMEOUT 20000000000ull
 
+// ============================================================================
+// Original kernel: uint4 store-based allgather (kept as fallback)
+// ============================================================================
 template<int SHARED_SIZE = 1024>
 __global__ void ag_nvl_kernel(
     void** dst_buffers_all_ranks, 
@@ -89,24 +93,261 @@ __global__ void ag_nvl_kernel(
     }
 }
 
+// ============================================================================
+// TMA-based allgather kernel: all-to-all with cp.async.bulk
+//
+// Design:
+//   - Each SM owns a contiguous byte-range of the local src data.
+//   - The data is loaded from GMEM into SMEM in tiles, then each tile is
+//     TMA-bulk-copied to all R destination buffers concurrently.
+//   - TMA S2G (shared-to-global) writes go over NVLink to IPC-mapped remote
+//     buffers. Blackwell TMA supports ~128 outstanding ops per SM, so all
+//     R writes per tile are fully concurrent.
+//   - Completion: all SMs converge via local atomicAdd, then the last SM
+//     does fence.release.sys + remote atomic flag to signal all peers.
+//
+// SMEM layout (multi-warp version):
+//   - NUM_PIPELINES independent pipelines, each with double-buffered tiles.
+//   - Each pipeline is owned by one warp.
+//   - pipeline[p].tile[0..1]: double-buffered tile data
+//   - pipeline[p].mbar[0..1]: mbarriers for G2S completion tracking
+//   - Total SMEM: NUM_PIPELINES * (2 * TILE_BYTES + 16) bytes
+//
+// Thread structure:
+//   - NUM_PIPELINES warps (e.g., 4 warps = 128 threads). Each warp's elected
+//     thread issues TMA commands for its pipeline. Warps work on independent
+//     sub-chunks of the SM's assigned data range.
+// ============================================================================
+
+// TILE_BYTES per pipeline: 16 KB per tile, double-buffered = 32 KB per pipeline.
+// With 4 pipelines: 128 KB SMEM total + mbarriers. Well within 228 KB.
+static constexpr int AG_TMA_TILE_BYTES = 16384;
+static constexpr int AG_TMA_NUM_PIPELINES = 4;
+
+__global__ void __launch_bounds__(AG_TMA_NUM_PIPELINES * 32, 1)
+ag_nvl_tma_kernel(
+    void** dst_buffers_all_ranks,
+    void* src,
+    int bytes_per_rank,
+    int64_t* iter_id_ptr,
+    unsigned long long* flag_nvl_ptr,  // NVLink-accessible flag on rank 0
+    unsigned long long* flag_sm_ptr,   // Local SM convergence flag
+    int rank_idx,
+    int rank_num
+) {
+    constexpr int TILE_BYTES = AG_TMA_TILE_BYTES;
+    constexpr int NUM_PIPELINES = AG_TMA_NUM_PIPELINES;
+    // Per-pipeline SMEM: 2 tiles + 2 mbarriers (8B each, aligned)
+    constexpr int PIPELINE_SMEM = 2 * TILE_BYTES + 16;
+
+    extern __shared__ char smem_raw[];
+
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+
+    // Each warp owns a pipeline with its own tile buffers and mbarriers.
+    char* my_smem = smem_raw + warp_id * PIPELINE_SMEM;
+    char* tiles[2] = {my_smem, my_smem + TILE_BYTES};
+    uint64_t* mbars[2] = {
+        reinterpret_cast<uint64_t*>(my_smem + 2 * TILE_BYTES),
+        reinterpret_cast<uint64_t*>(my_smem + 2 * TILE_BYTES + 8)
+    };
+
+    auto iter_id = *iter_id_ptr;
+    iter_id++;
+
+    // Each SM handles a contiguous byte-range of src, split among pipelines.
+    int sm_chunk_bytes = (bytes_per_rank + gridDim.x - 1) / gridDim.x;
+    sm_chunk_bytes = (sm_chunk_bytes + 15) & ~15;
+    int sm_chunk_start = blockIdx.x * sm_chunk_bytes;
+    int sm_chunk_end = min(sm_chunk_start + sm_chunk_bytes, bytes_per_rank);
+    if (sm_chunk_start >= bytes_per_rank) {
+        sm_chunk_start = sm_chunk_end = 0;
+    }
+    int sm_remaining = sm_chunk_end - sm_chunk_start;
+
+    // Split SM's chunk among warps (pipelines).
+    int warp_chunk_bytes = (sm_remaining + NUM_PIPELINES - 1) / NUM_PIPELINES;
+    warp_chunk_bytes = (warp_chunk_bytes + 15) & ~15;
+    int warp_chunk_start = sm_chunk_start + warp_id * warp_chunk_bytes;
+    int warp_chunk_end = min(warp_chunk_start + warp_chunk_bytes, sm_chunk_end);
+    if (warp_chunk_start >= sm_chunk_end) {
+        warp_chunk_start = warp_chunk_end = 0;
+    }
+    int warp_remaining = warp_chunk_end - warp_chunk_start;
+    int num_tiles = (warp_remaining + TILE_BYTES - 1) / TILE_BYTES;
+
+    char* src_bytes = reinterpret_cast<char*>(src);
+
+    bool is_leader = elect_sync(~0u);
+
+    if (is_leader) {
+        cuda::ptx::mbarrier_init(mbars[0], 1u);
+        cuda::ptx::mbarrier_init(mbars[1], 1u);
+    }
+    __syncwarp();
+
+    int parity[2] = {0, 0};
+
+    for (int t = 0; t < num_tiles; t++) {
+        int slot = t & 1;
+        int tile_offset = warp_chunk_start + t * TILE_BYTES;
+        int tile_size = min(TILE_BYTES, warp_chunk_end - tile_offset);
+        int tma_size = (tile_size + 15) & ~15;
+
+        // Issue TMA G2S
+        if (is_leader) {
+            cuda::ptx::mbarrier_arrive_expect_tx(
+                cuda::ptx::sem_release,
+                cuda::ptx::scope_cta,
+                cuda::ptx::space_shared,
+                mbars[slot],
+                static_cast<uint32_t>(tma_size));
+
+            cuda::ptx::cp_async_bulk(
+                cuda::ptx::space_shared,
+                cuda::ptx::space_global,
+                reinterpret_cast<void*>(tiles[slot]),
+                reinterpret_cast<const void*>(src_bytes + tile_offset),
+                static_cast<uint32_t>(tma_size),
+                mbars[slot]);
+        }
+
+        // Wait for previous S2G to finish reading SMEM
+        if (t > 0 && is_leader) {
+            cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
+        }
+
+        // Wait for G2S completion
+        if (is_leader) {
+            while (!cuda::ptx::mbarrier_try_wait_parity(mbars[slot], parity[slot])) {}
+            parity[slot] ^= 1;
+        }
+        __syncwarp();
+
+        // Issue S2G to all destination ranks
+        if (is_leader) {
+            int dst_offset_in_rank = rank_idx * bytes_per_rank + tile_offset;
+
+            for (int r = 0; r < rank_num; r++) {
+                char* dst_ptr = reinterpret_cast<char*>(
+                    reinterpret_cast<void**>(dst_buffers_all_ranks)[r]);
+
+                cuda::ptx::cp_async_bulk(
+                    cuda::ptx::space_global,
+                    cuda::ptx::space_shared,
+                    reinterpret_cast<void*>(dst_ptr + dst_offset_in_rank),
+                    reinterpret_cast<const void*>(tiles[slot]),
+                    static_cast<uint32_t>(tma_size));
+            }
+            cuda::ptx::cp_async_bulk_commit_group();
+        }
+    }
+
+    // Drain all S2G writes for this warp.
+    if (is_leader) {
+        cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+    }
+    __syncwarp();
+
+    // ---- Cross-SM convergence + cross-rank signaling ----
+    // All warps in the block must converge before signaling.
+    __syncthreads();
+
+    // System-scope fence to ensure all NVLink writes are globally visible.
+    asm volatile("fence.release.sys;" ::: "memory");
+
+    int is_last_SM = 0;
+    if (threadIdx.x == 0) {
+        unsigned long long value_to_add =
+            blockIdx.x == 0 ? MAX_BLOCKS - gridDim.x + 1 : 1;
+        auto old_val = atomicAdd(flag_sm_ptr, value_to_add);
+        is_last_SM =
+            (gridDim.x == 1 || old_val + value_to_add == iter_id * MAX_BLOCKS);
+    }
+
+    if (is_last_SM) {
+        // Signal all peers via NVLink atomic on rank 0's flag
+        asm volatile("red.relaxed.sys.global.add.u64 [%0], %1;"
+                     :
+                     : "l"(__cvta_generic_to_global(flag_nvl_ptr)), "n"(1)
+                     : "memory");
+        *iter_id_ptr = iter_id;
+        auto expected = iter_id * rank_num;
+        clock_t s = clock64();
+        unsigned long long flag_data = 0;
+
+        // Spin-wait for all ranks to complete
+        do {
+            asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
+                         : "=l"(flag_data)
+                         : "l"(__cvta_generic_to_global(flag_nvl_ptr))
+                         : "memory");
+            if (clock64() - s > 2ull * TIMEOUT) {
+                printf("HYBRID-EP TMA ALLGATHER TIMEOUT: SM %d expecting %llu got %llu\n",
+                       blockIdx.x, (unsigned long long)expected, flag_data);
+                break;
+            }
+        } while (flag_data < expected);
+    }
+}
+
 void CustomAllgather::launch(torch::Tensor src, int ag_sms, cudaStream_t stream) {
-    auto bytes_per_rank = src.numel() * src.element_size();;
+    auto bytes_per_rank = src.numel() * src.element_size();
     auto rank_num = num_of_ranks_per_node;
     assert(rank_idx >= 0 && rank_idx < rank_num);
     assert(rank_num <= MAX_NUM_OF_RANKS_PER_NODE);
-    assert(bytes_per_rank % 16 == 0); // Use LDG.128 / STG.128
+    assert(bytes_per_rank % 16 == 0);  // TMA minimum alignment
 
-    int block_size = 1024;
-    ag_nvl_kernel<<<ag_sms, block_size, 0, stream>>>(
-        dst_buffers_all_ranks_gpu, 
-        src.data_ptr(), 
-        bytes_per_rank, 
-        iter_id_ptr, 
-        flag_nvl_ptr, 
-        flag_sm_ptr, 
-        rank_idx, 
-        rank_num
-    );
+    // Use TMA kernel by default for intra-node (NVLink) allgather.
+    // The TMA kernel writes to IPC-mapped NVLink peer buffers via cp.async.bulk;
+    // this only works within a single NVLink domain (multi-node uses NCCL instead,
+    // gated by num_of_nodes > 1 in executor.cu, before this function is called).
+    // Set HYBRID_EP_USE_AG_NVL_LEGACY=1 to fall back to the original uint4-store kernel.
+    const char* legacy_env = getenv("HYBRID_EP_USE_AG_NVL_LEGACY");
+    bool use_legacy = legacy_env && (legacy_env[0] == '1');
+
+    if (use_legacy) {
+        int block_size = 1024;
+        ag_nvl_kernel<<<ag_sms, block_size, 0, stream>>>(
+            dst_buffers_all_ranks_gpu,
+            src.data_ptr(),
+            bytes_per_rank,
+            iter_id_ptr,
+            flag_nvl_ptr,
+            flag_sm_ptr,
+            rank_idx,
+            rank_num
+        );
+    } else {
+        // TMA kernel: NUM_PIPELINES warps per block, each with double-buffered tiles
+        constexpr int TILE_BYTES = AG_TMA_TILE_BYTES;
+        constexpr int NUM_PIPELINES = AG_TMA_NUM_PIPELINES;
+        constexpr int PIPELINE_SMEM = 2 * TILE_BYTES + 16;
+        int smem_bytes = NUM_PIPELINES * PIPELINE_SMEM;
+        int block_threads = NUM_PIPELINES * 32;
+
+        // Set max dynamic SMEM for this kernel if needed
+        static bool smem_configured = false;
+        if (!smem_configured) {
+            cudaFuncSetAttribute(
+                ag_nvl_tma_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes);
+            smem_configured = true;
+        }
+
+        ag_nvl_tma_kernel<<<ag_sms, block_threads, smem_bytes, stream>>>(
+            dst_buffers_all_ranks_gpu,
+            src.data_ptr(),
+            bytes_per_rank,
+            iter_id_ptr,
+            flag_nvl_ptr,
+            flag_sm_ptr,
+            rank_idx,
+            rank_num
+        );
+    }
 }
 
 void CustomAllgather::init(pybind11::object process_group, int rank_idx, BufferConfig buffer_config, ExtendedMemoryAllocator* allocator) {
