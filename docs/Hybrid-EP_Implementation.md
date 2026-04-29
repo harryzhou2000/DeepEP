@@ -637,7 +637,7 @@ All combine kernel parameters are configurable via environment variables and bec
 |----------|---------|-------------|
 | `NUM_OF_STAGES_G2S_COMBINE_API` | 10 | G2S SMEM pipeline stages (total, split across pipelines) |
 | `NUM_OF_STAGES_S2G_COMBINE_API` | 2 | S2G SMEM pipeline stages |
-| `NUM_TOKENS_COMBINE_REDUCE_BATCH_COMBINE_API` | 1 | Batch size for combine reduction. 0 = half pipeline depth |
+| `NUM_TOKENS_COMBINE_REDUCE_BATCH` | 1 | Batch size for combine reduction. 0 = half pipeline depth |
 | `NUM_OF_TOKENS_PER_GROUP_COMBINE_API` | 4 | Output tokens per group assigned to each pipeline |
 | `NUM_OF_TOKENS_PER_CHUNK_COMBINE_API` | 64 | Chunk size for inter-rank synchronization |
 | `NUM_SMS_COMBINE` | 24 | Number of SMs for combine kernel |
@@ -648,7 +648,7 @@ All combine kernel parameters are configurable via environment variables and bec
 
 ```bash
 NUM_OF_STAGES_G2S_COMBINE_API=64 NUM_OF_STAGES_S2G_COMBINE_API=8 \
-NUM_TOKENS_COMBINE_REDUCE_BATCH_COMBINE_API=16 NUM_OF_TOKENS_PER_GROUP_COMBINE_API=1 \
+NUM_TOKENS_COMBINE_REDUCE_BATCH=16 NUM_OF_TOKENS_PER_GROUP_COMBINE_API=1 \
 NUM_SMS_DISPATCH=32 NUM_SMS_COMBINE=64
 ```
 
