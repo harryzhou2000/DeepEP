@@ -212,8 +212,8 @@ __global__ void assign_positions_kernel(
       int idx = target_rank * E_per_rank + local_expert;
 
       int pos = atomicAdd(&position_counters[idx], 1);
-      direct_write_map[(int64_t)t * TOPK + k] =
-          expert_base[idx] + my_prefix[idx] + pos;
+      int dest_row = expert_base[idx] + my_prefix[idx] + pos;
+      direct_write_map[(int64_t)t * TOPK + k] = dest_row;
     }
   }
 }

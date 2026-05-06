@@ -1516,17 +1516,15 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
                 // Note: only 1 elected thread per warp is active here (elect_sync at S2G entry).
                 // local_token_id = chunk_offset + within-chunk position
                 int local_token_id = i * NUM_OF_TOKENS_PER_CHUNK + k * NUM_OF_TOKENS_PER_LOAD_ITER + n;
-                constexpr int EXPERTS_PER_NODE = NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE;
                 // Iterate over TOPK entries for this token
                 for(int tk = 0; tk < TOPK; tk++){
                   int32_t dest_row = direct_write_map[local_token_id * TOPK + tk];
                   if(dest_row < 0) continue;
-                  // Decode target rank from the routing map
+                  // Read global expert ID, derive target_rank and local_expert (node-local)
                   int eg = (int)topk_routing_map[local_token_id * TOPK + tk];
-                  if(eg < 0) continue;
-                  int local_eg = eg - node_rank * EXPERTS_PER_NODE;
-                  int target_rank = local_eg / NUM_OF_EXPERTS_PER_RANK;
-                  int local_expert = local_eg % NUM_OF_EXPERTS_PER_RANK;
+                  int node_local_eg = eg - node_rank * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE);
+                  int target_rank = node_local_eg / NUM_OF_EXPERTS_PER_RANK;
+                  int local_expert = node_local_eg % NUM_OF_EXPERTS_PER_RANK;
 
                   // TMA write token to direct position on target rank
                   TOKEN_DATA_TYPE* remote_token_addr = remote_expert_output_token[target_rank]
