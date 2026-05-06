@@ -1513,6 +1513,7 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
 
               if constexpr(DIRECT_PERMUTE) {
                 // Direct-permute path: write token to each expert-grouped position on each target rank.
+                // Note: only 1 elected thread per warp is active here (elect_sync at S2G entry).
                 // local_token_id = chunk_offset + within-chunk position
                 int local_token_id = i * NUM_OF_TOKENS_PER_CHUNK + k * NUM_OF_TOKENS_PER_LOAD_ITER + n;
                 constexpr int EXPERTS_PER_NODE = NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE;
