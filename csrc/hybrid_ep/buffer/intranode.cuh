@@ -14,13 +14,19 @@
 
 struct IntraNodeDispatchBuffers {
     APP_TOKEN_DATA_TYPE data_type;
-    // Output buffers to experts
+    // Output buffers to experts (staging: one copy per token, deduplicated)
     void *        expert_output_token = nullptr;
     void **       expert_output_token_all_ranks = nullptr;
     float *       expert_output_prob = nullptr;
     float **      expert_output_prob_all_ranks = nullptr;
     float *       expert_output_scaling_factor = nullptr;
     float **      expert_output_scaling_factor_all_ranks = nullptr;
+    // Direct-permute output buffers (expert-grouped: tokens duplicated per active expert)
+    // NVLink-accessible, sized for num_permuted_tokens * H.
+    void *        direct_output_token = nullptr;
+    void **       direct_output_token_all_ranks = nullptr;
+    float *       direct_output_prob = nullptr;
+    float **      direct_output_prob_all_ranks = nullptr;
     // Misc flags
     uint32_t *    intra_node_write_completion_flags = nullptr;
     uint32_t *    expected_intra_node_flag_value = nullptr;

@@ -300,10 +300,15 @@ void Executor::dispatch_core(HybridEpConfigInstance config, DispatchArgs& args) 
     if(args.direct_permute) {
         param.direct_write_map = args.direct_write_map.has_value() ?
             args.direct_write_map.value().data_ptr<int32_t>() : nullptr;
-        param.topk_routing_map = args.global_routing_map.has_value() ?
-            args.global_routing_map.value().data_ptr<int16_t>() : nullptr;
-        // In direct mode, S2G writes to the final expert-grouped buffers directly
-        // (the same pointers as expert_output_token_all_ranks, which are NVLink-accessible)
+        // topk_routing_map must point to local_rank's slice of the global routing map
+        // (S2G indexes as topk_routing_map[local_token_id * TOPK + k] with local_token_id 0-based)
+        if(args.global_routing_map.has_value()) {
+            int topk = args.global_routing_map.value().size(1);
+            param.topk_routing_map = args.global_routing_map.value().data_ptr<int16_t>()
+                + (int64_t)local_rank * args.num_of_tokens_per_rank * topk;
+        } else {
+            param.topk_routing_map = nullptr;
+        }
     } else {
         param.direct_write_map = nullptr;
         param.topk_routing_map = nullptr;

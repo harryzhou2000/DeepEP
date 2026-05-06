@@ -30,6 +30,9 @@ struct BufferConfig {
   /** Number of chunks, used for buffer sizing; grow_to on this triggers reallocate when chunk size shrinks. */
   int num_of_dispatch_chunks;
   int num_of_combine_chunks;
+  /** Direct-permute output buffer size (expert-grouped, tokens duplicated per active expert).
+   *  0 = direct-permute not used, skip allocation. */
+  int64_t num_permuted_tokens_direct = 0;
 
   /*
    *  Validation check
