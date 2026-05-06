@@ -285,16 +285,109 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
 
     success = test_direct_dispatch(buffer, group)
+    if not success:
+        dist.barrier()
+        dist.destroy_process_group()
+        if local_rank == 0:
+            raise RuntimeError("Direct-permute dispatch test FAILED")
+        return
+
+    # Benchmark: compare direct vs non-direct dispatch times
+    if args.benchmark:
+        test_benchmark(buffer, group)
 
     dist.barrier()
     dist.destroy_process_group()
 
-    if not success and local_rank == 0:
-        raise RuntimeError("Direct-permute dispatch test FAILED")
+
+def test_benchmark(buffer, group):
+    """Benchmark direct-permute dispatch."""
+    from utils import bench
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    num_experts = NUM_LOCAL_EXPERTS * world_size
+
+    torch.manual_seed(42 + rank)
+    hidden, probs, topk_idx, topk_weights = init_tensor(
+        HIDDEN_DIM, NUM_TOKENS_PER_RANK, TOPK, num_experts
+    )
+
+    if rank == 0:
+        print(f"\n=== Benchmark: H={HIDDEN_DIM}, T={NUM_TOKENS_PER_RANK}, "
+              f"E_local={NUM_LOCAL_EXPERTS}, K={TOPK}, R={world_size}, pad={PAD_MULTIPLE} ===")
+
+    # --- Setup: allgather routing map, warmup direct path ---
+    local_routing = topk_idx.to(torch.int16).contiguous()
+    global_routing = torch.empty(
+        NUM_TOKENS_PER_RANK * world_size, TOPK, dtype=torch.int16, device="cuda"
+    )
+    dist.all_gather_into_tensor(
+        global_routing.view(torch.int8),
+        local_routing.view(torch.int8),
+        group=group
+    )
+
+    # Warmup to get num_permuted_tokens and JIT-compile
+    direct_tokens, _, _, direct_tpe, direct_handle = buffer.dispatch_with_permute(
+        hidden=hidden,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        num_of_experts=num_experts,
+        num_permuted_tokens=int(NUM_TOKENS_PER_RANK * TOPK * 1.04),
+        pad_multiple=PAD_MULTIPLE,
+        dense_routing=True,
+        direct_permute=True,
+        global_routing_map=global_routing,
+    )
+    num_permuted_tokens = direct_tpe.sum().item()
+
+    dispatch_direct_args = {
+        'hidden': hidden,
+        'topk_idx': topk_idx,
+        'topk_weights': topk_weights,
+        'num_of_experts': num_experts,
+        'num_permuted_tokens': num_permuted_tokens,
+        'pad_multiple': PAD_MULTIPLE,
+        'dense_routing': True,
+        'direct_permute': True,
+        'global_routing_map': global_routing,
+        'handle': direct_handle,
+    }
+
+    # --- Benchmark ---
+    t_avg, t_min, t_max = bench(lambda: buffer.dispatch_with_permute(**dispatch_direct_args))
+
+    # Gather times from all ranks
+    t_tensor = torch.tensor([t_avg], device='cuda', dtype=torch.float64)
+    gathered = [torch.zeros(1, device='cuda', dtype=torch.float64) for _ in range(world_size)]
+    dist.all_gather(gathered, t_tensor)
+    times = [x.item() for x in gathered]
+
+    if rank == 0:
+        t_avg_all = sum(times) / len(times)
+        t_min_all = min(times)
+        t_max_all = max(times)
+
+        # Token bytes written over NVLink (each token written once to target rank's buffer)
+        # num_permuted_tokens * H * sizeof(dtype) + num_permuted_tokens * sizeof(float) [probs]
+        token_bytes = num_permuted_tokens * HIDDEN_DIM * 2  # bf16
+        prob_bytes = num_permuted_tokens * 4  # float32
+        total_bytes = token_bytes + prob_bytes
+        bw = total_bytes / 1e9 / t_avg_all
+
+        print(f'  dispatch (direct-permute):')
+        print(f'    time:       avg={t_avg_all*1e6:.1f} us  [min={t_min_all*1e6:.1f}, max={t_max_all*1e6:.1f}]')
+        print(f'    tokens:     {num_permuted_tokens} permuted ({NUM_TOKENS_PER_RANK} input × K={TOPK})')
+        print(f'    NVL write:  {total_bytes/1e6:.1f} MB  (token={token_bytes/1e6:.1f} + prob={prob_bytes/1e6:.1f})')
+        print(f'    throughput: {bw:.2f} GB/s')
+
+    dist.barrier()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Test direct-permute dispatch')
     parser.add_argument('--num-processes', type=int, default=8)
+    parser.add_argument('--benchmark', action='store_true', help='Run timing benchmark after correctness')
     args = parser.parse_args()
     torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)
