@@ -69,6 +69,7 @@ def get_extension_hybrid_ep_cpp():
         "csrc/hybrid_ep/executor/executor.cu",
         "csrc/hybrid_ep/extension/permute.cu",
         "csrc/hybrid_ep/extension/allgather.cu",
+        "csrc/hybrid_ep/extension/direct_permute.cu",
         "csrc/hybrid_ep/pybind_hybrid_ep.cu",
     ]
     include_dirs = [

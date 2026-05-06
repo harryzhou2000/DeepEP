@@ -9,6 +9,7 @@
 #include "hybrid_ep.cuh"
 #include "utils.cuh"
 #include "config.cuh"
+#include "extension/direct_permute.cuh"
 
 namespace py = pybind11;
 
@@ -221,4 +222,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("fuse_unpermute_combine") = false,
              py::arg("with_probs") = false);    
     
+    m.def("compute_direct_write_map", &compute_direct_write_map,
+          "Compute direct-write addressing map for permute-free dispatch",
+          py::arg("global_routing_map"),
+          py::arg("T_per_rank"),
+          py::arg("R_per_node"),
+          py::arg("E_per_rank"),
+          py::arg("TOPK"),
+          py::arg("pad_multiple"),
+          py::arg("local_rank"),
+          py::arg("node_rank"),
+          py::arg("num_permuted_tokens") = -1);
   }
