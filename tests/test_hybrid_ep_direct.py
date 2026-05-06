@@ -30,10 +30,15 @@ NUM_SMS_COMBINE = int(os.environ.get("NUM_SMS_COMBINE", 24))
 
 
 def init_tensor(hidden_dim, seq_len, topk, num_of_experts):
-    """Generate test data: tokens + dense routing."""
+    """Generate test data: tokens + dense routing.
+    
+    Tokens are set to unique values (global_token_id encoded in first element)
+    so that multiset comparison is trivial.
+    """
+    # Each token has a unique identifier: rank will be added later after dist init
     hidden = torch.randn(seq_len, hidden_dim, device="cuda", dtype=torch.bfloat16)
     topk_idx = torch.zeros(seq_len, topk, device="cuda", dtype=torch.int64)
-    topk_weights = torch.ones(seq_len, topk, device="cuda", dtype=torch.float32)
+    topk_weights = torch.rand(seq_len, topk, device="cuda", dtype=torch.float32) + 0.1
 
     for i in range(seq_len):
         selected_experts = torch.randperm(num_of_experts, device="cuda")[:topk]
@@ -66,6 +71,16 @@ def test_direct_dispatch(buffer, group):
     hidden, probs, topk_idx, topk_weights = init_tensor(
         HIDDEN_DIM, NUM_TOKENS_PER_RANK, TOPK, num_experts
     )
+    # Encode unique global token ID in first 4 elements using base-16 digits.
+    # Each component is in [0, 15], safe for any numeric format (bf16, fp8, mxfp8).
+    # Supports up to 16^4 = 65536 unique tokens total.
+    global_offset = rank * NUM_TOKENS_PER_RANK
+    for i in range(NUM_TOKENS_PER_RANK):
+        gid = global_offset + i
+        hidden[i, 0] = float((gid >> 0) & 0xF)
+        hidden[i, 1] = float((gid >> 4) & 0xF)
+        hidden[i, 2] = float((gid >> 8) & 0xF)
+        hidden[i, 3] = float((gid >> 12) & 0xF)
     dist.barrier()
 
     # === Pure-torch reference ===
@@ -159,12 +174,14 @@ def test_direct_dispatch(buffer, group):
         expert_starts.append(expert_starts[-1] + direct_tpe_cpu[e].item())
 
     num_expert_match = 0
+    num_prob_match = 0
     for e in range(NUM_LOCAL_EXPERTS):
         start = expert_starts[e]
         end = expert_starts[e + 1]
         count = end - start
         if count == 0:
             num_expert_match += 1
+            num_prob_match += 1
             continue
 
         # Reference tokens for this expert (from pure-torch)
@@ -175,27 +192,72 @@ def test_direct_dispatch(buffer, group):
         assert ref_expert.shape[0] == count, \
             f"Expert {e}: ref count {ref_expert.shape[0]} != direct count {count}"
 
-        # Compare as multisets (order within expert is non-deterministic)
-        ref_set = set(tuple(r.tolist()) for r in ref_expert.float())
-        direct_set = set(tuple(r.tolist()) for r in direct_expert.float())
-        if ref_set == direct_set:
+        # Compare using token IDs (first 4 elements = base-16 encoded global token index)
+        def extract_id(row):
+            return (int(row[0].item()), int(row[1].item()), int(row[2].item()), int(row[3].item()))
+
+        ref_ids = set(extract_id(r) for r in ref_expert.float())
+        direct_ids = set(extract_id(r) for r in direct_expert.float())
+        if ref_ids == direct_ids:
             num_expert_match += 1
         else:
-            missing = len(ref_set - direct_set)
-            extra = len(direct_set - ref_set)
+            missing = len(ref_ids - direct_ids)
+            extra = len(direct_ids - ref_ids)
             if rank == 0:
-                print(f"    Expert {e} MISMATCH (count={count}): "
+                print(f"    Expert {e} TOKEN MISMATCH (count={count}): "
                       f"missing={missing}, extra={extra}")
 
-    if rank == 0:
-        print(f"  Token content: {num_expert_match}/{NUM_LOCAL_EXPERTS} experts match")
-        if num_expert_match == NUM_LOCAL_EXPERTS:
-            print(f"\n  === ALL TESTS PASSED ===")
+        # Compare probs: build (token_id → prob) mapping for this expert
+        if direct_probs is not None:
+            ref_prob_map = {}
+            for r, p in zip(ref_expert.float(), ref_probs_per_expert[e]):
+                tid = extract_id(r)
+                ref_prob_map[tid] = p.item()
+            direct_prob_region = direct_probs[start:end]
+            direct_prob_map = {}
+            for r, p in zip(direct_expert.float(), direct_prob_region):
+                tid = extract_id(r)
+                direct_prob_map[tid] = p.item()
+            probs_ok = True
+            for tid, ref_p in ref_prob_map.items():
+                if tid not in direct_prob_map:
+                    probs_ok = False
+                    break
+                if abs(ref_p - direct_prob_map[tid]) > 1e-5:
+                    probs_ok = False
+                    break
+            if probs_ok:
+                num_prob_match += 1
+            elif rank == 0:
+                # Show first mismatch
+                for tid, ref_p in ref_prob_map.items():
+                    if tid in direct_prob_map and abs(ref_p - direct_prob_map[tid]) > 1e-5:
+                        print(f"    Expert {e} PROB MISMATCH: token {tid} "
+                              f"ref={ref_p:.6f} direct={direct_prob_map[tid]:.6f}")
+                        break
         else:
-            print(f"\n  === {NUM_LOCAL_EXPERTS - num_expert_match} EXPERTS DIFFER ===")
+            num_prob_match += 1
+
+    # Aggregate results across all ranks
+    local_result = torch.tensor([num_expert_match, num_prob_match], device="cuda", dtype=torch.int32)
+    all_results = torch.empty(world_size * 2, device="cuda", dtype=torch.int32)
+    dist.all_gather_into_tensor(all_results, local_result, group=group)
+
+    total_expert_match = all_results[0::2].sum().item()
+    total_prob_match = all_results[1::2].sum().item()
+    total_experts = NUM_LOCAL_EXPERTS * world_size
+
+    if rank == 0:
+        print(f"  Token content: {total_expert_match}/{total_experts} experts match across all ranks")
+        print(f"  Prob content:  {total_prob_match}/{total_experts} experts match across all ranks")
+        if total_expert_match == total_experts and total_prob_match == total_experts:
+            print(f"\n  === ALL TESTS PASSED ({total_experts} experts verified) ===")
+        else:
+            print(f"\n  === FAILURES: tokens={total_experts - total_expert_match}, "
+                  f"probs={total_experts - total_prob_match} ===")
 
     dist.barrier()
-    return num_expert_match == NUM_LOCAL_EXPERTS
+    return total_expert_match == total_experts and total_prob_match == total_experts
 
 
 def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
