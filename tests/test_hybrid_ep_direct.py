@@ -183,8 +183,10 @@ def test_direct_dispatch(buffer, group):
 def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     _, _, group = init_dist(local_rank, num_local_ranks)
 
-    # Static budget for the direct-output buffer: T_per_rank * TOPK (worst case)
-    num_permuted_tokens_direct = NUM_TOKENS_PER_RANK * TOPK
+    # Static budget for the direct-output buffer.
+    # With random routing, actual token counts can slightly exceed T*TOPK due to non-uniform
+    # distribution. Add 5% margin to account for statistical variation.
+    num_permuted_tokens_direct = int(NUM_TOKENS_PER_RANK * TOPK * 1.05)
 
     buffer = deep_ep.HybridEPBuffer(
         group=group,

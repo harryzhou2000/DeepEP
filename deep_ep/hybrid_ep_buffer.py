@@ -100,13 +100,14 @@ class HybridEPBuffer:
             num_blocks_unpermute=num_blocks_unpermute,
         )
         # Set direct-permute buffer size before allocation
+        buf_config = self.configurer.buffer_config
         if num_permuted_tokens_direct is not None and num_permuted_tokens_direct > 0:
-            self.configurer.buffer_config.num_permuted_tokens_direct = num_permuted_tokens_direct
+            buf_config.num_permuted_tokens_direct = num_permuted_tokens_direct
 
         # Create C++ buffer - this will allocate all buffers during construction
         self.runtime = hybrid_ep_cpp.HybridEPBuffer(
             self.group,
-            self.configurer.buffer_config,
+            buf_config,
             self.local_rank,
             self.node_rank,
             self.group_size,
