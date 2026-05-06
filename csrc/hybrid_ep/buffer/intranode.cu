@@ -29,6 +29,9 @@ void NVLCoordinator::destroy() {
         free_buffer(dispatch_buffers.expert_output_prob, true);
     }
     free_buffer(dispatch_buffers.expert_output_scaling_factor, true);
+    // Clean up direct-output buffers
+    free_buffer(dispatch_buffers.direct_output_token, true);
+    free_buffer(dispatch_buffers.direct_output_prob, true);
     free_buffer(dispatch_buffers.expected_intra_node_flag_value, false);
     free_buffer(dispatch_buffers.intra_node_flag_parity, false);
     if (local_rank == 0) {
@@ -51,6 +54,18 @@ void NVLCoordinator::destroy() {
         dispatch_buffers.expert_output_token_all_ranks = nullptr;
         dispatch_buffers.expert_output_prob_all_ranks = nullptr;
         dispatch_buffers.expert_output_scaling_factor_all_ranks = nullptr;
+    }
+    if (dispatch_buffers.direct_output_token_all_ranks != nullptr) {
+        for (int i = 0; i < buffer_config.num_of_ranks_per_node; i++) {
+            if (i != local_rank) {
+                remote_allocator->close_handle(dispatch_buffers.direct_output_token_all_ranks[i]);
+                remote_allocator->close_handle(dispatch_buffers.direct_output_prob_all_ranks[i]);
+            }
+        }
+        delete[] dispatch_buffers.direct_output_token_all_ranks;
+        delete[] dispatch_buffers.direct_output_prob_all_ranks;
+        dispatch_buffers.direct_output_token_all_ranks = nullptr;
+        dispatch_buffers.direct_output_prob_all_ranks = nullptr;
     }
     // Clean up fused permute-dispatch buffers
     free_buffer(dispatch_buffers.expected_permute_flag_value, false);
@@ -232,8 +247,26 @@ void NVLCoordinator::allocate_dispatch_buffers() {
     CUDA_CHECK(cudaMemset(dispatch_buffers.intra_node_expert_output_chunk_flags, 0,
                            chunk_flags_numel * sizeof(uint32_t)));
 
+    // Allocate direct-permute output buffers (expert-grouped, tokens duplicated per active expert)
+    // Only allocated when num_permuted_tokens_direct > 0 (i.e., direct-permute is requested)
+    bool has_direct = (buffer_config.num_permuted_tokens_direct > 0);
+    if (has_direct) {
+      int64_t direct_token_elts = buffer_config.num_permuted_tokens_direct * buffer_config.hidden_dim;
+      int64_t direct_prob_elts = buffer_config.num_permuted_tokens_direct;
+      remote_allocator->allocate((void**)&dispatch_buffers.direct_output_token,
+                                 direct_token_elts * sizeof_token_data_type);
+      remote_allocator->allocate((void**)&dispatch_buffers.direct_output_prob,
+                                 direct_prob_elts * sizeof(float));
+    }
+
     // Create memory handles for cross-rank buffer exchange
-    MemHandle handles[5];
+    // Layout: [0]=expert_output_token, [1]=expert_output_prob, [2]=expert_output_scaling_factor,
+    //         [3]=intra_node_write_completion_flags (rank 0 only), [4]=chunk_flags,
+    //         [5]=direct_output_token (if has_direct), [6]=direct_output_prob (if has_direct)
+    constexpr int kBaseHandles = 5;
+    constexpr int kDirectHandles = 2;
+    int num_handles = kBaseHandles + (has_direct ? kDirectHandles : 0);
+    std::vector<MemHandle> handles(num_handles);
     remote_allocator->get_handle(&handles[0], dispatch_buffers.expert_output_token);
     remote_allocator->get_handle(&handles[1], dispatch_buffers.expert_output_prob);
     remote_allocator->get_handle(&handles[2], dispatch_buffers.expert_output_scaling_factor);
@@ -241,11 +274,16 @@ void NVLCoordinator::allocate_dispatch_buffers() {
       remote_allocator->get_handle(&handles[3], dispatch_buffers.intra_node_write_completion_flags);
     }
     remote_allocator->get_handle(&handles[4], dispatch_buffers.intra_node_expert_output_chunk_flags);
+    if (has_direct) {
+      remote_allocator->get_handle(&handles[5], dispatch_buffers.direct_output_token);
+      remote_allocator->get_handle(&handles[6], dispatch_buffers.direct_output_prob);
+    }
     
     // Pack handles into tensor
-    dispatch_memory_handles = torch::empty({static_cast<int64_t>(sizeof(handles))},
+    size_t handles_bytes = num_handles * sizeof(MemHandle);
+    dispatch_memory_handles = torch::empty({static_cast<int64_t>(handles_bytes)},
                                           torch::dtype(torch::kUInt8).device(torch::kCPU));
-    memcpy(dispatch_memory_handles.data_ptr<uint8_t>(), handles, sizeof(handles));
+    memcpy(dispatch_memory_handles.data_ptr<uint8_t>(), handles.data(), handles_bytes);
 
     // Check possible errors
     CUDA_CHECK(cudaGetLastError());
@@ -361,10 +399,19 @@ void NVLCoordinator::open_handles_from_other_ranks(
       remote_allocator->open_handle((void**)(&dispatch_buffers.intra_node_write_completion_flags),
                              &intra_node_write_completion_flags_handle);
     }
+
+    // Check if direct-output buffers were allocated (handles at positions 5, 6)
+    bool has_direct = (buffer_config.num_permuted_tokens_direct > 0);
   
     // Open the handles for expert_output and chunk_flags
     dispatch_buffers.intra_node_expert_output_chunk_flags_all_ranks =
         new uint32_t*[buffer_config.num_of_ranks_per_node];
+    if (has_direct) {
+      dispatch_buffers.direct_output_token_all_ranks =
+          new void*[buffer_config.num_of_ranks_per_node];
+      dispatch_buffers.direct_output_prob_all_ranks =
+          new float*[buffer_config.num_of_ranks_per_node];
+    }
     for (int i = 0; i < buffer_config.num_of_ranks_per_node; i++) {
       MemHandle expert_output_token_handle, expert_output_prob_handle,
           expert_output_scaling_factor_handle, chunk_flags_handle;
@@ -382,11 +429,11 @@ void NVLCoordinator::open_handles_from_other_ranks(
   
       if (i != local_rank) {
         remote_allocator->open_handle((void**)(&dispatch_buffers.expert_output_token_all_ranks[i]),
-                               &expert_output_token_handle);
+                                &expert_output_token_handle);
         remote_allocator->open_handle((void**)(&dispatch_buffers.expert_output_prob_all_ranks[i]),
-                               &expert_output_prob_handle);
+                                &expert_output_prob_handle);
         remote_allocator->open_handle((void**)(&dispatch_buffers.expert_output_scaling_factor_all_ranks[i]), 
-                               &expert_output_scaling_factor_handle);
+                                &expert_output_scaling_factor_handle);
         remote_allocator->open_handle(
             (void**)&dispatch_buffers.intra_node_expert_output_chunk_flags_all_ranks[i],
             &chunk_flags_handle);
@@ -400,6 +447,24 @@ void NVLCoordinator::open_handles_from_other_ranks(
             dispatch_buffers.expert_output_scaling_factor;
         dispatch_buffers.intra_node_expert_output_chunk_flags_all_ranks[i] =
             dispatch_buffers.intra_node_expert_output_chunk_flags;
+      }
+
+      // Open direct-output handles (positions 5, 6)
+      if (has_direct) {
+        MemHandle direct_token_handle, direct_prob_handle;
+        memcpy(&direct_token_handle, base_ptr + sizeof(MemHandle) * 5, sizeof(MemHandle));
+        memcpy(&direct_prob_handle, base_ptr + sizeof(MemHandle) * 6, sizeof(MemHandle));
+        if (i != local_rank) {
+          remote_allocator->open_handle((void**)(&dispatch_buffers.direct_output_token_all_ranks[i]),
+                                  &direct_token_handle);
+          remote_allocator->open_handle((void**)(&dispatch_buffers.direct_output_prob_all_ranks[i]),
+                                  &direct_prob_handle);
+        } else {
+          dispatch_buffers.direct_output_token_all_ranks[i] =
+              dispatch_buffers.direct_output_token;
+          dispatch_buffers.direct_output_prob_all_ranks[i] =
+              dispatch_buffers.direct_output_prob;
+        }
       }
     }
 

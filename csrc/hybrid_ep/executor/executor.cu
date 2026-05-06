@@ -256,9 +256,16 @@ void Executor::dispatch_core(HybridEpConfigInstance config, DispatchArgs& args) 
     
     // Setup output pointers
     for (int i = 0; i < config.num_of_ranks_per_node; i++) {
-      param.expert_output_token[i] = reinterpret_cast<DType*>(
-          intra_node_dispatch_buffers->expert_output_token_all_ranks[i]);
-      param.expert_output_prob[i] = intra_node_dispatch_buffers->expert_output_prob_all_ranks[i];
+      if (args.direct_permute) {
+        // Direct-permute: S2G writes to dedicated direct-output buffers (expert-grouped layout)
+        param.expert_output_token[i] = reinterpret_cast<DType*>(
+            intra_node_dispatch_buffers->direct_output_token_all_ranks[i]);
+        param.expert_output_prob[i] = intra_node_dispatch_buffers->direct_output_prob_all_ranks[i];
+      } else {
+        param.expert_output_token[i] = reinterpret_cast<DType*>(
+            intra_node_dispatch_buffers->expert_output_token_all_ranks[i]);
+        param.expert_output_prob[i] = intra_node_dispatch_buffers->expert_output_prob_all_ranks[i];
+      }
       param.expert_output_scaling_factor[i] = 
           intra_node_dispatch_buffers->expert_output_scaling_factor_all_ranks[i];
     }

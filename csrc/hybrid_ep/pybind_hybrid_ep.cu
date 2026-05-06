@@ -44,6 +44,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("num_of_tokens_per_chunk_combine_api", &BufferConfig::num_of_tokens_per_chunk_combine_api)
         .def_readwrite("num_of_dispatch_chunks", &BufferConfig::num_of_dispatch_chunks)
         .def_readwrite("num_of_combine_chunks", &BufferConfig::num_of_combine_chunks)
+        .def_readwrite("num_permuted_tokens_direct", &BufferConfig::num_permuted_tokens_direct)
         .def("is_valid", &BufferConfig::is_valid)
         .def("__repr__", [](const BufferConfig &config) {
           return "<BufferConfig hidden_dim=" +

@@ -96,6 +96,9 @@ def test_direct_dispatch(buffer, group):
         group=group
     )
 
+    # Use same num_permuted_tokens as the reference path for comparable output shapes
+    num_permuted_tokens = ref_tokens.shape[0]
+
     (
         direct_tokens, direct_probs, direct_scaling, direct_tpe, direct_handle
     ) = buffer.dispatch_with_permute(
@@ -103,6 +106,7 @@ def test_direct_dispatch(buffer, group):
         topk_idx=topk_idx,
         topk_weights=topk_weights,
         num_of_experts=num_experts,
+        num_permuted_tokens=num_permuted_tokens,
         pad_multiple=PAD_MULTIPLE,
         dense_routing=True,
         direct_permute=True,
@@ -179,6 +183,9 @@ def test_direct_dispatch(buffer, group):
 def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     _, _, group = init_dist(local_rank, num_local_ranks)
 
+    # Static budget for the direct-output buffer: T_per_rank * TOPK (worst case)
+    num_permuted_tokens_direct = NUM_TOKENS_PER_RANK * TOPK
+
     buffer = deep_ep.HybridEPBuffer(
         group=group,
         hidden_dim=HIDDEN_DIM,
@@ -187,6 +194,7 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         use_fp8=False,
         num_sms_dispatch_api=NUM_SMS_DISPATCH,
         num_sms_combine_api=NUM_SMS_COMBINE,
+        num_permuted_tokens_direct=num_permuted_tokens_direct,
     )
 
     success = test_direct_dispatch(buffer, group)

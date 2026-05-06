@@ -318,14 +318,16 @@ HybridEPBuffer::dispatch_with_permute(
    args.dense_to_expert_map = handle.dense_to_expert_map;
    args.tokens_per_expert = handle.tokens_per_expert;
  }
- // Pre-allocate output tensors for both fuse and standalone permute paths
- args.local_expert_output_token = 
-    torch::empty({handle.num_permuted_tokens, config.hidden_dim}, torch::dtype(hidden.dtype()).device(torch::kCUDA));
- if (with_probs) {
-   args.local_expert_output_prob = torch::empty({handle.num_permuted_tokens}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
- }
- if (config.token_data_type == APP_TOKEN_DATA_TYPE::UINT8) {
-   args.local_expert_output_scaling_factor = torch::empty({handle.num_permuted_tokens, config.hidden_dim / 128}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+ // Pre-allocate output tensors for non-direct paths (fuse and standalone permute)
+ if (!direct_permute) {
+   args.local_expert_output_token = 
+      torch::empty({handle.num_permuted_tokens, config.hidden_dim}, torch::dtype(hidden.dtype()).device(torch::kCUDA));
+   if (with_probs) {
+     args.local_expert_output_prob = torch::empty({handle.num_permuted_tokens}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+   }
+   if (config.token_data_type == APP_TOKEN_DATA_TYPE::UINT8) {
+     args.local_expert_output_scaling_factor = torch::empty({handle.num_permuted_tokens, config.hidden_dim / 128}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+   }
  }
  
  // Run the full dispatch operation
@@ -333,9 +335,12 @@ HybridEPBuffer::dispatch_with_permute(
  config.topk = handle.config.topk;
 
  if(direct_permute) {
-   // Direct-permute path: compute addressing, zero output, dispatch directly to expert-grouped positions
+   // Direct-permute path: compute addressing, zero direct-output buffer, dispatch directly to expert-grouped positions
    assert(global_routing_map.has_value());
-   assert(handle.num_permuted_tokens >= 0);
+   assert(handle.num_permuted_tokens > 0 &&
+       "num_permuted_tokens must be explicitly provided (> 0) for direct_permute");
+   assert(handle.num_permuted_tokens <= buffer_config.num_permuted_tokens_direct &&
+       "num_permuted_tokens exceeds pre-allocated direct-output buffer (num_permuted_tokens_direct)");
    args.direct_permute = true;
    args.global_routing_map = global_routing_map.value();
 
@@ -356,12 +361,27 @@ HybridEPBuffer::dispatch_with_permute(
    handle.padded_tokens_per_expert = padded_tpe.to(torch::kInt64);
    handle.overflow_flag = overflow;
 
-   // Zero the output buffers (padding positions must be zero)
-   cudaMemsetAsync(args.local_expert_output_token.data_ptr(), 0,
+   // Output tensor is a view of the pre-allocated direct-output buffer on local rank
+   auto dtype = hidden.dtype();
+   auto* local_direct_token = nvl_coordinator.dispatch_buffers.direct_output_token;
+   args.local_expert_output_token = torch::from_blob(
+       local_direct_token,
+       {handle.num_permuted_tokens, config.hidden_dim},
+       torch::dtype(dtype).device(torch::kCUDA));
+   if (with_probs) {
+     auto* local_direct_prob = nvl_coordinator.dispatch_buffers.direct_output_prob;
+     args.local_expert_output_prob = torch::from_blob(
+         local_direct_prob,
+         {handle.num_permuted_tokens},
+         torch::dtype(torch::kFloat32).device(torch::kCUDA));
+   }
+
+   // Zero the direct-output buffers (padding positions must be zero)
+   cudaMemsetAsync(local_direct_token, 0,
        handle.num_permuted_tokens * config.hidden_dim * c10::elementSize(hidden.scalar_type()),
        args.stream);
    if(with_probs) {
-     cudaMemsetAsync(args.local_expert_output_prob.value().data_ptr(), 0,
+     cudaMemsetAsync(nvl_coordinator.dispatch_buffers.direct_output_prob, 0,
          handle.num_permuted_tokens * sizeof(float), args.stream);
    }
  }

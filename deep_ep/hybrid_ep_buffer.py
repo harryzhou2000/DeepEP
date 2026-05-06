@@ -46,6 +46,10 @@ class HybridEPBuffer:
         num_sms_preprocessing_api: int = None,
         num_blocks_permute: int = None,
         num_blocks_unpermute: int = None,
+        # Direct-permute: pre-allocated expert-grouped output buffer size.
+        # Set to the max num_permuted_tokens that will be used across all dispatch calls.
+        # 0 or None = direct-permute not used, skip allocation.
+        num_permuted_tokens_direct: int = None,
         # Experimental features
         load_cached_kernels: bool = False,  
         use_shared_buffer: bool = True,
@@ -95,6 +99,9 @@ class HybridEPBuffer:
             num_blocks_permute=num_blocks_permute,
             num_blocks_unpermute=num_blocks_unpermute,
         )
+        # Set direct-permute buffer size before allocation
+        if num_permuted_tokens_direct is not None and num_permuted_tokens_direct > 0:
+            self.configurer.buffer_config.num_permuted_tokens_direct = num_permuted_tokens_direct
 
         # Create C++ buffer - this will allocate all buffers during construction
         self.runtime = hybrid_ep_cpp.HybridEPBuffer(
@@ -397,6 +404,9 @@ class HybridEPBuffer:
                 if pad_multiple is not None and pad_multiple > 0:
                     assert num_permuted_tokens % pad_multiple == 0, \
                         f"num_permuted_tokens ({num_permuted_tokens}) must be a multiple of pad_multiple ({pad_multiple}) in non-blocking mode."
+            if direct_permute:
+                assert num_permuted_tokens is not None and num_permuted_tokens > 0, \
+                    "num_permuted_tokens must be explicitly provided (> 0) for direct_permute mode."
 
             if handle is None:
                 assert hidden.size(0) == routing_data.size(
