@@ -252,13 +252,18 @@ template<int NUM_OF_STAGES,
 struct dispatch_kernel_dynamic_shared_memory_buffer_t<uint16_t, NUM_OF_STAGES, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, 1, true>{
   // Shared memory token buffer. Should be 128B alignment for optimal perf for TMA.
   alignas(128) uint16_t intra_node_token_buffer[NUM_OF_STAGES][HIDDEN_DIM];
-  // Shared memory ping-pong buffer for sparse_to_dense map for token data chunks. Should be 128B alignment for optimal perf for TMA.
+  // Shared memory ping-pong buffer for chunk metadata. Should be 128B alignment for optimal perf for TMA.
+  // Non-direct: sparse_to_dense_map [2][chunk_size][R] int32
+  // Direct: direct_write_map [2][chunk_size][TOPK] int32 — TOPK can be > R, so this may be larger.
+  // We allocate the max of the two at compile time. The direct path uses TOPK from the JIT template;
+  // for the struct definition we use a conservative upper bound via NUM_OF_RANKS_PER_NODE (non-direct case).
+  // The direct path accesses this buffer via reinterpret_cast with runtime TOPK stride.
   alignas(128) int32_t sparse_to_dense_map_buffer[2][NUM_OF_TOKENS_PER_CHUNK][NUM_OF_RANKS_PER_NODE];
   // Shared memory Prob buffer. Only used in FW dispatch. Should be 16B alignment so can be used with TMA. 128B is too strict.
   alignas(16) float intra_node_prob_buffer[NUM_OF_STAGES][NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE];
   // Shared memory mbarrier that protect token entry, 1st for producer->consumer, 2nd for consumer->producer. Should be 8B alignment(natural alignment).
   alignas(8) uint64_t intra_node_mbarrier_buffer[NUM_OF_STAGES][2]; 
-  // Shared memory mbarrier that protect sparse_to_dense map. Should be 8B alignment(natural alignment).
+  // Shared memory mbarrier that protect sparse_to_dense map / direct_write_map. Should be 8B alignment(natural alignment).
   alignas(8) uint64_t sparse_to_dense_map_mbarrier_buffer[2];
   // Shared memory mbarrier that perform sync within S2G warp group. Should be 8B alignment(natural alignment).
   alignas(8) uint64_t S2G_group_mbarrier_buffer;
