@@ -615,6 +615,9 @@ struct dispatch_kernel_param_t{
   int node_rank;
   // The number of token output by attn layer on a rank/GPU.
   int num_of_tokens_per_rank;
+  // Direct-permute addressing (optional, nullptr when not in direct mode).
+  const int32_t* direct_write_map;   // [num_of_tokens_per_rank, TOPK] — dest row per topk slot
+  const int16_t* topk_routing_map;   // [num_of_tokens_per_rank, TOPK] — global expert IDs (local rank's slice)
 #ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
 #ifndef USE_NIXL
   // qp info and mr info (DOCA only)
@@ -1307,17 +1310,21 @@ template<typename INTRA_NODE_S2G_GROUP,
          int NUM_OF_RANKS_PER_NODE,
          int NUM_OF_NODES,
          int NUM_OF_BLOCKS,
-         bool FORWARD_DISPATCH>
+         bool FORWARD_DISPATCH,
+         bool DIRECT_PERMUTE = false,
+         int TOPK = 0>
 inline __device__ void S2G_warp_group_device_function(const int local_rank,
-                                                      const int node_rank,
-                                                      const int num_of_tokens_per_rank,
-                                                      const bool* rdma_to_attn_map,
-                                                      const int32_t* sparse_to_dense_map,
-                                                      TOKEN_DATA_TYPE* const* remote_expert_output_token,
-                                                      float* const* remote_expert_output_prob,
-                                                      float* const* remote_expert_output_scaling_factor,
-                                                      uint32_t* const* intra_node_expert_output_chunk_flags,
-                                                      SMEM_TYPE* smem_buffer_ptr)
+                                                       const int node_rank,
+                                                       const int num_of_tokens_per_rank,
+                                                       const bool* rdma_to_attn_map,
+                                                       const int32_t* sparse_to_dense_map,
+                                                       TOKEN_DATA_TYPE* const* remote_expert_output_token,
+                                                       float* const* remote_expert_output_prob,
+                                                       float* const* remote_expert_output_scaling_factor,
+                                                       uint32_t* const* intra_node_expert_output_chunk_flags,
+                                                       SMEM_TYPE* smem_buffer_ptr,
+                                                       const int32_t* direct_write_map = nullptr,
+                                                       const int16_t* topk_routing_map = nullptr)
 {
   static_assert(NUM_OF_IN_FLIGHT_S2G < NUM_OF_STAGES, "NUM_OF_IN_FLIGHT_S2G must smaller than NUM_OF_STAGES.");
   // Load rdma_to_attn_map using LDG.128. Each token will need 1 bool from this map.
@@ -1500,11 +1507,58 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
             bool token_needed_by_this_node = *(reinterpret_cast<bool*>(&rdma_to_attn_map_data) + n);
             if(token_needed_by_this_node){
               const sparse_to_dense_map_load_t* sparse_to_dense_map_load_addr = reinterpret_cast<const sparse_to_dense_map_load_t*>
-                                                                                (&smem_buffer_ptr->sparse_to_dense_map_buffer[sparse_to_dense_map_stage][k * NUM_OF_TOKENS_PER_LOAD_ITER + n][0]);
+                                                                                 (&smem_buffer_ptr->sparse_to_dense_map_buffer[sparse_to_dense_map_stage][k * NUM_OF_TOKENS_PER_LOAD_ITER + n][0]);
               // Wait until token entry within the shared memory has been produced.
               while(!cuda::ptx::mbarrier_try_wait_parity(&smem_buffer_ptr->intra_node_mbarrier_buffer[stage][0], producer_parity)){}
 
-              // This token entry will be multicast to all ranks within this node which need this token and its properties.
+              if constexpr(DIRECT_PERMUTE) {
+                // Direct-permute path: write token to each expert-grouped position on each target rank.
+                // local_token_id = chunk_offset + within-chunk position
+                int local_token_id = i * NUM_OF_TOKENS_PER_CHUNK + k * NUM_OF_TOKENS_PER_LOAD_ITER + n;
+                constexpr int EXPERTS_PER_NODE = NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE;
+                // Iterate over TOPK entries for this token
+                for(int tk = 0; tk < TOPK; tk++){
+                  int32_t dest_row = direct_write_map[local_token_id * TOPK + tk];
+                  if(dest_row < 0) continue;
+                  // Decode target rank from the routing map
+                  int eg = (int)topk_routing_map[local_token_id * TOPK + tk];
+                  if(eg < 0) continue;
+                  int local_eg = eg - node_rank * EXPERTS_PER_NODE;
+                  int target_rank = local_eg / NUM_OF_EXPERTS_PER_RANK;
+                  int local_expert = local_eg % NUM_OF_EXPERTS_PER_RANK;
+
+                  // TMA write token to direct position on target rank
+                  TOKEN_DATA_TYPE* remote_token_addr = remote_expert_output_token[target_rank]
+                      + (dest_row * static_cast<int64_t>(HIDDEN_DIM));
+                  cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
+                                           cuda::ptx::space_shared,
+                                           reinterpret_cast<void*>(remote_token_addr),
+                                           reinterpret_cast<const void*>(&smem_buffer_ptr->intra_node_token_buffer[stage][0]),
+                                           (uint32_t)(HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE)));
+
+                  // Scalar prob write (register → remote GMEM via NVLink)
+                  if constexpr(FORWARD_DISPATCH){
+                    float prob_val = smem_buffer_ptr->intra_node_prob_buffer[stage][target_rank * NUM_OF_EXPERTS_PER_RANK + local_expert];
+                    float* remote_prob_addr = remote_expert_output_prob[target_rank] + dest_row;
+                    asm volatile("st.relaxed.sys.global.f32 [%0], %1;"
+                                 :
+                                 : "l"(__cvta_generic_to_global(remote_prob_addr)), "f"(prob_val)
+                                 : "memory");
+                  }
+
+                  // Scaling factor for FP8 tokens
+                  if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value){
+                    float* remote_scaling_factor_addr = remote_expert_output_scaling_factor[target_rank]
+                        + (dest_row * (HIDDEN_DIM / 128));
+                    cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
+                                             cuda::ptx::space_shared,
+                                             reinterpret_cast<void*>(remote_scaling_factor_addr),
+                                             reinterpret_cast<const void*>(&smem_buffer_ptr->intra_node_scaling_factor_buffer[stage][0]),
+                                             (uint32_t)((HIDDEN_DIM / 128) * sizeof(float)));
+                  }
+                }
+              } else {
+              // Staging-buffer path (original): multicast token to all target ranks.
               // The current implementation do the multicast by issue each unicast separately(we call it a unicast group). If NVLS can be used, we should use it here. 
               // Multicast of a src token will be ditributed to multiple S2G threads.
               for(int m = INTRA_NODE_S2G_GROUP::warp_rank(); m < NUM_OF_SPARSE_TO_DENSE_MAP_LOAD_ITER_PER_INPUT_TOKEN; m += INTRA_NODE_S2G_GROUP::warp_size()){
@@ -1557,6 +1611,7 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
                   }
                 }
               }
+              } // end else (!DIRECT_PERMUTE)
               // Commit the previous issued S2G TMA instructions for the same shared memory token entry to a bulk async copy group.
               cuda::ptx::cp_async_bulk_commit_group();
               // Add 1 more in-flight S2G token entry to the counter.
@@ -4272,7 +4327,11 @@ template<typename TOKEN_DATA_TYPE,
          // Number of CUDA block running permute.
          int NUM_OF_PERMUTE_BLOCKS,
          // Whether the dispatch kernel is used in forward process or backward process.
-         bool FORWARD_DISPATCH>
+         bool FORWARD_DISPATCH,
+         // Direct-permute mode: S2G writes directly to expert-grouped positions.
+         bool DIRECT_PERMUTE = false,
+         // Top-k routing width (only used when DIRECT_PERMUTE=true).
+         int TOPK = 0>
 // Each CUDA block of dispatch kernel has 3 warp groups and has the following layout: 
 // 1. inter-node warp group(i.e. RDMA N2N warp group, 1 warp, only valid for multinode scenario) 2. intra-node G2S warp group(i.e. NVL G2S warp group, 1 warp). 
 // 3. intra-node S2G warp group(i.e. NVL S2G warp group, 2(multinode scenario)-3(single-node scenario) warps). Total 4 warps per CUDA block/SM.
@@ -4399,9 +4458,9 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
     }else if(threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size()){
       // Intra-node S2G warp groups.
       S2G_warp_group_device_function
-      <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, FORWARD_DISPATCH>
+      <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, FORWARD_DISPATCH, DIRECT_PERMUTE, TOPK>
       (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.sparse_to_dense_map, param.expert_output_token, param.expert_output_prob,
-      param.expert_output_scaling_factor, param.intra_node_expert_output_chunk_flags, smem_buffer_ptr);
+      param.expert_output_scaling_factor, param.intra_node_expert_output_chunk_flags, smem_buffer_ptr, param.direct_write_map, param.topk_routing_map);
     }else{
       // Too many threads, should not goes here.
     }
@@ -4457,9 +4516,9 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
   }else if(threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size()){
     // Intra-node S2G warp groups.
     S2G_warp_group_device_function
-    <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, FORWARD_DISPATCH>
+    <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, FORWARD_DISPATCH, DIRECT_PERMUTE, TOPK>
     (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.sparse_to_dense_map, param.expert_output_token, param.expert_output_prob,
-    param.expert_output_scaling_factor, param.intra_node_expert_output_chunk_flags, smem_buffer_ptr);
+    param.expert_output_scaling_factor, param.intra_node_expert_output_chunk_flags, smem_buffer_ptr, param.direct_write_map, param.topk_routing_map);
   }else{
     // Too many threads, should not goes here.
   }
