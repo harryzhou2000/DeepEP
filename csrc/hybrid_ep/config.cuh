@@ -93,7 +93,7 @@ struct HybridEpConfigInstance {
   bool device_side_sync_dispatch_api = true;
   // Direct-permute: S2G writes directly to expert-grouped positions (no staging buffer).
   bool direct_permute_dispatch = false;
-  int topk = 0;  // TOPK routing width (needed for direct_permute addressing)
+  // topk is already declared earlier in this struct (line 67) — reused for direct_permute addressing
 
   /*
    *  Combine API Config

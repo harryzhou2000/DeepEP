@@ -209,10 +209,7 @@ HybridEPBuffer::dispatch(
   }else {
     throw std::runtime_error("Invalid token data type:" +  std::to_string(static_cast<int>(config.token_data_type)));
   }
-  if(!direct_permute) {
-    executor.dispatch_postprocess(config, args);
-  }
-  // For direct_permute, data is already in args.local_expert_output_token/prob from dispatch_core
+  executor.dispatch_postprocess(config, args);
 
   return std::make_tuple(args.local_expert_output_token, args.local_expert_output_prob, args.local_expert_output_scaling_factor);
 }
@@ -377,7 +374,10 @@ HybridEPBuffer::dispatch_with_permute(
  }else {
    throw std::runtime_error("Invalid token data type:" +  std::to_string(static_cast<int>(config.token_data_type)));
  }
- executor.dispatch_postprocess(config, args);
+ if(!direct_permute) {
+   executor.dispatch_postprocess(config, args);
+ }
+ // For direct_permute, data is already in args.local_expert_output_token/prob from dispatch_core
 
  return std::make_tuple(args.local_expert_output_token, args.local_expert_output_prob, args.local_expert_output_scaling_factor);
 }

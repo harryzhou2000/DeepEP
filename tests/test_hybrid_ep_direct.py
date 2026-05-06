@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
-# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# See LICENSE for license information.
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Lightweight multi-GPU test for direct-permute dispatch.
@@ -11,25 +9,24 @@ non-direct path. Token data per expert should match (as sets, since ordering
 within an expert region may differ).
 
 Run: python tests/test_hybrid_ep_direct.py --num-processes 8
-
-Requires: multi-GPU (NVL8), builds on top of existing HybridEPBuffer infra.
 """
 
+import argparse
 import os
-import sys
 import torch
 import torch.distributed as dist
-import argparse
+import deep_ep
 
-# Env vars for test
-HIDDEN_DIM = int(os.getenv("HIDDEN_DIM", "512"))
-NUM_TOKENS_PER_RANK = int(os.getenv("NUM_TOKENS_PER_RANK", "8192"))
-NUM_LOCAL_EXPERTS = int(os.getenv("NUM_LOCAL_EXPERTS", "32"))
-TOPK = int(os.getenv("TOPK", "36"))
-PAD_MULTIPLE = int(os.getenv("PAD_MULTIPLE", "1"))
-NUM_SMS_DISPATCH = int(os.getenv("NUM_SMS_DISPATCH", "24"))
-NUM_SMS_COMBINE = int(os.getenv("NUM_SMS_COMBINE", "24"))
-MAX_NUM_OF_TOKENS_PER_RANK = int(os.getenv("MAX_NUM_OF_TOKENS_PER_RANK", str(NUM_TOKENS_PER_RANK)))
+from utils import init_dist
+
+HIDDEN_DIM = int(os.environ.get("HIDDEN_DIM", 512))
+NUM_TOKENS_PER_RANK = int(os.environ.get("NUM_TOKENS_PER_RANK", 8192))
+MAX_NUM_OF_TOKENS_PER_RANK = int(os.environ.get("MAX_NUM_OF_TOKENS_PER_RANK", str(NUM_TOKENS_PER_RANK)))
+NUM_LOCAL_EXPERTS = int(os.environ.get("NUM_LOCAL_EXPERTS", 32))
+TOPK = int(os.environ.get("TOPK", 36))
+PAD_MULTIPLE = int(os.environ.get("PAD_MULTIPLE", 1))
+NUM_SMS_DISPATCH = int(os.environ.get("NUM_SMS_DISPATCH", 24))
+NUM_SMS_COMBINE = int(os.environ.get("NUM_SMS_COMBINE", 24))
 
 
 def init_tensor(hidden_dim, seq_len, topk, num_of_experts):
@@ -49,32 +46,18 @@ def init_tensor(hidden_dim, seq_len, topk, num_of_experts):
     return hidden, probs, topk_idx, topk_weights
 
 
-def test_direct_dispatch():
+def test_direct_dispatch(buffer, group):
     """Compare direct-permute dispatch against reference (non-direct) path."""
-    import deep_ep
-
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     num_experts = NUM_LOCAL_EXPERTS * world_size
-    group = dist.group.WORLD
 
     if rank == 0:
         print(f"\n=== Direct-Permute Dispatch Test ===")
         print(f"  H={HIDDEN_DIM}, T={NUM_TOKENS_PER_RANK}, E_local={NUM_LOCAL_EXPERTS}, "
               f"K={TOPK}, R={world_size}, pad={PAD_MULTIPLE}")
 
-    # Create buffer
-    buffer = deep_ep.HybridEPBuffer(
-        group=group,
-        hidden_dim=HIDDEN_DIM,
-        max_num_of_tokens_per_rank=MAX_NUM_OF_TOKENS_PER_RANK,
-        num_local_experts=NUM_LOCAL_EXPERTS,
-        use_fp8=False,
-        num_sms_dispatch_api=NUM_SMS_DISPATCH,
-        num_sms_combine_api=NUM_SMS_COMBINE,
-    )
-
-    # Generate test data (same seed all ranks for reproducibility)
+    # Generate test data
     torch.manual_seed(42 + rank)
     hidden, probs, topk_idx, topk_weights = init_tensor(
         HIDDEN_DIM, NUM_TOKENS_PER_RANK, TOPK, num_experts
@@ -172,10 +155,9 @@ def test_direct_dispatch():
         if torch.equal(ref_sorted, direct_sorted):
             num_expert_match += 1
         else:
-            # Fallback: check if sets of rows are identical via sorting
+            # Fallback: check if sets of rows are identical
             ref_flat = ref_expert.view(count, -1).float()
             direct_flat = direct_expert.view(count, -1).float()
-            # Sort by first few elements for stability
             ref_idx = ref_flat[:, 0].argsort(stable=True)
             direct_idx = direct_flat[:, 0].argsort(stable=True)
             if torch.allclose(ref_flat[ref_idx], direct_flat[direct_idx], atol=0, rtol=0):
@@ -194,35 +176,30 @@ def test_direct_dispatch():
     return num_expert_match == NUM_LOCAL_EXPERTS
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Test direct-permute dispatch')
-    parser.add_argument('--num-processes', type=int, default=8)
-    args = parser.parse_args()
+def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+    _, _, group = init_dist(local_rank, num_local_ranks)
 
-    if "RANK" not in os.environ:
-        # Launch with torchrun
-        import subprocess
-        cmd = [
-            "torchrun",
-            f"--nproc_per_node={args.num_processes}",
-            "--master_port", "29511",
-            __file__,
-        ]
-        env = os.environ.copy()
-        result = subprocess.run(cmd, env=env)
-        sys.exit(result.returncode)
-    else:
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+    buffer = deep_ep.HybridEPBuffer(
+        group=group,
+        hidden_dim=HIDDEN_DIM,
+        max_num_of_tokens_per_rank=MAX_NUM_OF_TOKENS_PER_RANK,
+        num_local_experts=NUM_LOCAL_EXPERTS,
+        use_fp8=False,
+        num_sms_dispatch_api=NUM_SMS_DISPATCH,
+        num_sms_combine_api=NUM_SMS_COMBINE,
+    )
 
-        try:
-            success = test_direct_dispatch()
-            if not success:
-                sys.exit(1)
-        finally:
-            dist.destroy_process_group()
+    success = test_direct_dispatch(buffer, group)
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+    if not success and local_rank == 0:
+        raise RuntimeError("Direct-permute dispatch test FAILED")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Test direct-permute dispatch')
+    parser.add_argument('--num-processes', type=int, default=8)
+    args = parser.parse_args()
+    torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)
