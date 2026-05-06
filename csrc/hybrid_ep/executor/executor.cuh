@@ -34,6 +34,9 @@ struct HandleImpl {
     torch::Tensor overflow_flag;
     int64_t num_permuted_tokens = -1;
 
+    // Handle for direct-permute
+    torch::Tensor direct_write_map;  // [T_per_rank, TOPK] int32
+
     // Handle for fused permute
     torch::Tensor dense_chunk_layout;
     torch::Tensor dense_to_expert_map;
@@ -73,10 +76,15 @@ public:
         int pad_multiple;  // Used in the padding case of permute
         bool enable_permute = false;
         bool fuse_permute_dispatch = false;
+        bool direct_permute = false;  // Direct-write to expert-grouped positions
         bool non_blocking = false;  // If enable this, the produced num_dispatched_tokens will be put
                                         // on the CPU pinned memory, and the tokens_per_expert will be put
                                         // on the CPU, which may reduce the times of the sync
         int64_t num_of_tokens_per_rank;  // Dynamic sequence length
+        // Direct-permute addressing (set by executor when direct_permute=true)
+        c10::optional<torch::Tensor> direct_write_map;
+        // The allgathered routing map (needed by direct S2G for expert ID decode)
+        c10::optional<torch::Tensor> global_routing_map;
         cudaStream_t stream;
     };
 

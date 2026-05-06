@@ -213,7 +213,9 @@ std::string NVCCCompiler::get_dispatch_code(HybridEpConfigInstance config) {
          std::to_string(config.num_of_experts_per_rank) + ">::dispatch<" + token_type + ", " +
          std::to_string(config.num_of_stages_dispatch_api) + ", " + std::to_string(config.num_of_stages_permute_block_dispatch_api) + ", " + std::to_string(config.num_of_in_flight_s2g_dispatch_api) + ", " + std::to_string(config.num_of_in_flight_s2g_permute_block_dispatch_api) + ", " + std::to_string(config.pad_multiple) + ", " + std::to_string(config.num_of_additional_in_flight_s2g_dispatch_api) + ", " + std::to_string(config.num_of_tokens_per_chunk_dispatch_api) + ", " +
          std::to_string(config.num_of_blocks_dispatch_api) + ", " + std::to_string(config.num_of_blocks_permute) + ", " + (config.forward_dispatch_api ? "true" : "false") + ", " +
-         (config.device_side_sync_dispatch_api ? "true" : "false") + R"(>;
+         (config.device_side_sync_dispatch_api ? "true" : "false") + ", " +
+         (config.direct_permute_dispatch ? "true" : "false") + ", " +
+         std::to_string(config.topk) + R"(>;
             return func_ptr;
           }
         }
@@ -392,7 +394,9 @@ void KernelCache::run_dispatch_kernel(
         config.forward_dispatch_api,
         config.device_side_sync_dispatch_api,
         fuse_permute_dispatch,
-        non_blocking
+        non_blocking,
+        config.direct_permute_dispatch,
+        config.topk
     );
 
     auto it = kernel_cache.find(dispatch_kernel_key);

@@ -296,6 +296,19 @@ void Executor::dispatch_core(HybridEpConfigInstance config, DispatchArgs& args) 
         }
     }
 
+    // Direct-permute: set direct_write_map and topk_routing_map on param
+    if(args.direct_permute) {
+        param.direct_write_map = args.direct_write_map.has_value() ?
+            args.direct_write_map.value().data_ptr<int32_t>() : nullptr;
+        param.topk_routing_map = args.global_routing_map.has_value() ?
+            args.global_routing_map.value().data_ptr<int16_t>() : nullptr;
+        // In direct mode, S2G writes to the final expert-grouped buffers directly
+        // (the same pointers as expert_output_token_all_ranks, which are NVLink-accessible)
+    } else {
+        param.direct_write_map = nullptr;
+        param.topk_routing_map = nullptr;
+    }
+
     // Misc
     param.local_rank = local_rank;
     param.node_rank = node_rank;
@@ -307,6 +320,8 @@ void Executor::dispatch_core(HybridEpConfigInstance config, DispatchArgs& args) 
     param.d_qps_gpu = reinterpret_cast<void **>(inter_node_dispatch_buffers->d_qps_gpu);
     param.mr_info = reinterpret_cast<void*>(inter_node_dispatch_buffers->mr_info);
 #endif
+    // Set direct_permute config for JIT key generation
+    config.direct_permute_dispatch = args.direct_permute;
     // Launch kernel
     kernel_cache.run_dispatch_kernel<DType>(config, param, args.fuse_permute_dispatch, args.non_blocking, args.stream);
     nvtxRangePop();  // End of dispatch_core nvtx range

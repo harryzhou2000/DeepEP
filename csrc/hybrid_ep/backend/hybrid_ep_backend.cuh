@@ -5813,7 +5813,11 @@ public:
            // Whether the dispatch kernel is used in forward process.
            bool FORWARD_DISPATCH,
            // Whether the dispatch kernel need device-side sync before exit. 
-           bool DEVICE_SIDE_SYNC>
+           bool DEVICE_SIDE_SYNC,
+           // Direct-permute mode: S2G writes directly to expert-grouped positions.
+           bool DIRECT_PERMUTE = false,
+           // Top-k routing width (only used when DIRECT_PERMUTE=true).
+           int TOPK = 0>
   static void dispatch(dispatch_kernel_param_t<TOKEN_DATA_TYPE> param, cudaStream_t stream)
   {
     // The warp groups data type for dispatch kernel, must match the warp groups layout required by the dispatch kernel.
@@ -5844,7 +5848,7 @@ public:
     const auto dispatch_kernel_ptr = dispatch_kernel<TOKEN_DATA_TYPE, INTER_NODE_GROUP, INTRA_NODE_G2S_GROUP, INTRA_NODE_S2G_GROUP, PERMUTE_G2S_GROUP, PERMUTE_S2G_GROUP, NUM_OF_STAGES,
                                                      NUM_OF_STAGES_PERMUTE_BLOCK, NUM_OF_IN_FLIGHT_S2G, NUM_OF_IN_FLIGHT_S2G_PERMUTE_BLOCK, LOCAL_EXPERTS_PADDING_SIZE, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
                                                      NUM_OF_TOKENS_PER_CHUNK, HIDDEN_DIM, MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, 
-                                                     NUM_OF_BLOCKS, NUM_OF_PERMUTE_BLOCKS, FORWARD_DISPATCH>;
+                                                     NUM_OF_BLOCKS, NUM_OF_PERMUTE_BLOCKS, FORWARD_DISPATCH, DIRECT_PERMUTE, TOPK>;
 
     // Configure dynamic shared memory for the dispatch kernel.
 #ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
