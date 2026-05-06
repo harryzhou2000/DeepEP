@@ -1329,7 +1329,10 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
                                                        uint32_t* const* intra_node_expert_output_chunk_flags,
                                                        SMEM_TYPE* smem_buffer_ptr,
                                                        const int32_t* direct_write_map = nullptr,
-                                                       const int16_t* topk_routing_map = nullptr)
+                                                       const int16_t* topk_routing_map = nullptr,
+                                                       int32_t* direct_write_map_smem = nullptr,
+                                                       int16_t* direct_routing_map_smem = nullptr,
+                                                       uint64_t* direct_meta_mbarrier = nullptr)
 {
   static_assert(NUM_OF_IN_FLIGHT_S2G < NUM_OF_STAGES, "NUM_OF_IN_FLIGHT_S2G must smaller than NUM_OF_STAGES.");
   // Load rdma_to_attn_map using LDG.128. Each token will need 1 bool from this map.
@@ -1368,7 +1371,7 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
 
   // Only 1 thread per warp within the S2G warp group will be active, other threads will just exit.
   if(elect_sync(~0)){
-    // First warp(thread) will load the sparse_to_dense map for the first chunk for this CUDA block if any.
+    // First warp(thread) will load metadata for the first chunk for this CUDA block if any.
     if(INTRA_NODE_S2G_GROUP::warp_rank() == 0){
       if((int)blockIdx.x < num_of_chunks_per_rank){
         // How many token for this chunk.
@@ -1378,21 +1381,47 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
         }else{
           current_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
         }
-        // sparse_to_dense map load base addr.
-        const int32_t* sparse_to_dense_map_load_base_addr = sparse_to_dense_map + (node_rank * num_of_tokens_per_rank + (int)blockIdx.x * NUM_OF_TOKENS_PER_CHUNK) * NUM_OF_RANKS_PER_NODE;
-        // Load the sparse_to_dense map for the first chunk.
-        cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
-                                 cuda::ptx::space_global,
-                                 reinterpret_cast<void*>(&smem_buffer_ptr->sparse_to_dense_map_buffer[sparse_to_dense_map_stage][0][0]),
-                                 reinterpret_cast<const void*>(sparse_to_dense_map_load_base_addr),
-                                 (uint32_t)(current_chunk_size * NUM_OF_RANKS_PER_NODE * sizeof(int32_t)),
-                                 &smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[sparse_to_dense_map_stage]);
 
-        cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
-                                             cuda::ptx::scope_cta,
-                                             cuda::ptx::space_shared,
-                                             &smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[sparse_to_dense_map_stage],
-                                             (uint32_t)(current_chunk_size * NUM_OF_RANKS_PER_NODE * sizeof(int32_t))); 
+        if constexpr(!DIRECT_PERMUTE) {
+          // Non-direct: prefetch sparse_to_dense map for the first chunk.
+          const int32_t* sparse_to_dense_map_load_base_addr = sparse_to_dense_map + (node_rank * num_of_tokens_per_rank + (int)blockIdx.x * NUM_OF_TOKENS_PER_CHUNK) * NUM_OF_RANKS_PER_NODE;
+          cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
+                                   cuda::ptx::space_global,
+                                   reinterpret_cast<void*>(&smem_buffer_ptr->sparse_to_dense_map_buffer[sparse_to_dense_map_stage][0][0]),
+                                   reinterpret_cast<const void*>(sparse_to_dense_map_load_base_addr),
+                                   (uint32_t)(current_chunk_size * NUM_OF_RANKS_PER_NODE * sizeof(int32_t)),
+                                   &smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[sparse_to_dense_map_stage]);
+          cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
+                                               cuda::ptx::scope_cta,
+                                               cuda::ptx::space_shared,
+                                               &smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[sparse_to_dense_map_stage],
+                                               (uint32_t)(current_chunk_size * NUM_OF_RANKS_PER_NODE * sizeof(int32_t)));
+        } else {
+          // Direct-permute: prefetch direct_write_map + topk_routing_map for the first chunk.
+          int chunk_token_offset = (int)blockIdx.x * NUM_OF_TOKENS_PER_CHUNK;
+          uint32_t dwm_bytes = (uint32_t)(current_chunk_size * TOPK * sizeof(int32_t));
+          uint32_t drm_bytes = (uint32_t)(current_chunk_size * TOPK * sizeof(int16_t));
+          uint32_t total_tx = dwm_bytes + drm_bytes;
+          // Load direct_write_map chunk
+          cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
+                                   cuda::ptx::space_global,
+                                   reinterpret_cast<void*>(&direct_write_map_smem[sparse_to_dense_map_stage * NUM_OF_TOKENS_PER_CHUNK * TOPK]),
+                                   reinterpret_cast<const void*>(direct_write_map + (int64_t)chunk_token_offset * TOPK),
+                                   dwm_bytes,
+                                   &direct_meta_mbarrier[sparse_to_dense_map_stage]);
+          // Load topk_routing_map chunk
+          cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
+                                   cuda::ptx::space_global,
+                                   reinterpret_cast<void*>(&direct_routing_map_smem[sparse_to_dense_map_stage * NUM_OF_TOKENS_PER_CHUNK * TOPK]),
+                                   reinterpret_cast<const void*>(topk_routing_map + (int64_t)chunk_token_offset * TOPK),
+                                   drm_bytes,
+                                   &direct_meta_mbarrier[sparse_to_dense_map_stage]);
+          cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
+                                               cuda::ptx::scope_cta,
+                                               cuda::ptx::space_shared,
+                                               &direct_meta_mbarrier[sparse_to_dense_map_stage],
+                                               total_tx);
+        }
       }
     }
     // Loop through all data chunk. Data(chunk) parallel between multiple CUDA blocks.
@@ -1414,9 +1443,9 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
         uint64_t state_token = cuda::ptx::mbarrier_arrive(&smem_buffer_ptr->S2G_group_mbarrier_buffer);
         while(!cuda::ptx::mbarrier_try_wait(&smem_buffer_ptr->S2G_group_mbarrier_buffer, state_token)){}
 
-        // First warp(thread) will prefetch sparse_to_dense map for next chunk.
+        // First warp(thread) will prefetch metadata for next chunk.
         if(INTRA_NODE_S2G_GROUP::warp_rank() == 0){
-          // Calculate next chunk id for this CUDA block to prefetch sparse_to_dense map for next chunk.
+          // Calculate next chunk id for this CUDA block.
           int next_chunk_id;
           int next_node_id;
           int next_node_iter = j + 1;
@@ -1428,7 +1457,7 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
             next_node_id = node_rank;
           }
           
-          // If next chunk exist, load the sparse_to_dense map for next chunk.
+          // If next chunk exist, load metadata for next chunk.
           if(next_chunk_id < num_of_chunks_per_rank){
             // How many token for this chunk.
             int current_chunk_size;
@@ -1437,21 +1466,46 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
             }else{
               current_chunk_size = NUM_OF_TOKENS_PER_CHUNK;
             }
-            // sparse_to_dense map load base addr.
-            const int32_t* sparse_to_dense_map_load_base_addr = sparse_to_dense_map + (next_node_id * num_of_tokens_per_rank + next_chunk_id * NUM_OF_TOKENS_PER_CHUNK) * NUM_OF_RANKS_PER_NODE;
-            // Load the sparse_to_dense map for the next chunk.
-            cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
-                                     cuda::ptx::space_global,
-                                     reinterpret_cast<void*>(&smem_buffer_ptr->sparse_to_dense_map_buffer[sparse_to_dense_map_stage ^ 1][0][0]),
-                                     reinterpret_cast<const void*>(sparse_to_dense_map_load_base_addr),
-                                     (uint32_t)(current_chunk_size * NUM_OF_RANKS_PER_NODE * sizeof(int32_t)),
-                                     &smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[sparse_to_dense_map_stage ^ 1]);
 
-            cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
-                                                 cuda::ptx::scope_cta,
-                                                 cuda::ptx::space_shared,
-                                                 &smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[sparse_to_dense_map_stage ^ 1],
-                                                 (uint32_t)(current_chunk_size * NUM_OF_RANKS_PER_NODE * sizeof(int32_t)));
+            if constexpr(!DIRECT_PERMUTE) {
+              // Non-direct: prefetch sparse_to_dense map for next chunk.
+              const int32_t* sparse_to_dense_map_load_base_addr = sparse_to_dense_map + (next_node_id * num_of_tokens_per_rank + next_chunk_id * NUM_OF_TOKENS_PER_CHUNK) * NUM_OF_RANKS_PER_NODE;
+              cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
+                                       cuda::ptx::space_global,
+                                       reinterpret_cast<void*>(&smem_buffer_ptr->sparse_to_dense_map_buffer[sparse_to_dense_map_stage ^ 1][0][0]),
+                                       reinterpret_cast<const void*>(sparse_to_dense_map_load_base_addr),
+                                       (uint32_t)(current_chunk_size * NUM_OF_RANKS_PER_NODE * sizeof(int32_t)),
+                                       &smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[sparse_to_dense_map_stage ^ 1]);
+              cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
+                                                   cuda::ptx::scope_cta,
+                                                   cuda::ptx::space_shared,
+                                                   &smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[sparse_to_dense_map_stage ^ 1],
+                                                   (uint32_t)(current_chunk_size * NUM_OF_RANKS_PER_NODE * sizeof(int32_t)));
+            } else {
+              // Direct-permute: prefetch direct_write_map + topk_routing_map for next chunk.
+              int chunk_token_offset = next_chunk_id * NUM_OF_TOKENS_PER_CHUNK;
+              uint32_t dwm_bytes = (uint32_t)(current_chunk_size * TOPK * sizeof(int32_t));
+              uint32_t drm_bytes = (uint32_t)(current_chunk_size * TOPK * sizeof(int16_t));
+              uint32_t total_tx = dwm_bytes + drm_bytes;
+              int next_stage = sparse_to_dense_map_stage ^ 1;
+              cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
+                                       cuda::ptx::space_global,
+                                       reinterpret_cast<void*>(&direct_write_map_smem[next_stage * NUM_OF_TOKENS_PER_CHUNK * TOPK]),
+                                       reinterpret_cast<const void*>(direct_write_map + (int64_t)chunk_token_offset * TOPK),
+                                       dwm_bytes,
+                                       &direct_meta_mbarrier[next_stage]);
+              cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
+                                       cuda::ptx::space_global,
+                                       reinterpret_cast<void*>(&direct_routing_map_smem[next_stage * NUM_OF_TOKENS_PER_CHUNK * TOPK]),
+                                       reinterpret_cast<const void*>(topk_routing_map + (int64_t)chunk_token_offset * TOPK),
+                                       drm_bytes,
+                                       &direct_meta_mbarrier[next_stage]);
+              cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
+                                                   cuda::ptx::scope_cta,
+                                                   cuda::ptx::space_shared,
+                                                   &direct_meta_mbarrier[next_stage],
+                                                   total_tx);
+            }
           }
         }
         
@@ -1459,10 +1513,14 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
         int node_id = node_rank >= j ? node_rank - j : node_rank + NUM_OF_NODES - j;
         // Store every token and its properties from Shared to Global. Only store tokens that is needed by this node.
         const rdma_to_attn_map_load_t* rdma_to_attn_map_load_base_addr = reinterpret_cast<const rdma_to_attn_map_load_t*>(rdma_to_attn_map + 
-                                                                         (node_id * rdma_to_attn_map_size_per_node + i * NUM_OF_TOKENS_PER_CHUNK));
+                                                                          (node_id * rdma_to_attn_map_size_per_node + i * NUM_OF_TOKENS_PER_CHUNK));
 
-        // Wait for sparse_to_dense map ready in smem for current chunk.
-        while(!cuda::ptx::mbarrier_try_wait_parity(&smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[sparse_to_dense_map_stage], sparse_to_dense_map_parity)){}
+        // Wait for metadata ready in smem for current chunk.
+        if constexpr(!DIRECT_PERMUTE) {
+          while(!cuda::ptx::mbarrier_try_wait_parity(&smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[sparse_to_dense_map_stage], sparse_to_dense_map_parity)){}
+        } else {
+          while(!cuda::ptx::mbarrier_try_wait_parity(&direct_meta_mbarrier[sparse_to_dense_map_stage], sparse_to_dense_map_parity)){}
+        }
 
 #ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
         // How many S2G token entry of current chunk have been in-flight.
@@ -1519,14 +1577,15 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
               if constexpr(DIRECT_PERMUTE) {
                 // Direct-permute path: write token to each expert-grouped position on each target rank.
                 // Note: only 1 elected thread per warp is active here (elect_sync at S2G entry).
-                // local_token_id = chunk_offset + within-chunk position
-                int local_token_id = i * NUM_OF_TOKENS_PER_CHUNK + k * NUM_OF_TOKENS_PER_LOAD_ITER + n;
+                // within_chunk_token_id indexes into the SMEM ping-pong metadata buffer
+                int within_chunk_id = k * NUM_OF_TOKENS_PER_LOAD_ITER + n;
+                int smem_base = sparse_to_dense_map_stage * NUM_OF_TOKENS_PER_CHUNK * TOPK + within_chunk_id * TOPK;
                 // Iterate over TOPK entries for this token
                 for(int tk = 0; tk < TOPK; tk++){
-                  int32_t dest_row = direct_write_map[local_token_id * TOPK + tk];
+                  int32_t dest_row = direct_write_map_smem[smem_base + tk];
                   if(dest_row < 0) continue;
-                  // Read global expert ID, derive target_rank and local_expert (node-local)
-                  int eg = (int)topk_routing_map[local_token_id * TOPK + tk];
+                  // Read global expert ID from SMEM, derive target_rank and local_expert (node-local)
+                  int eg = (int)direct_routing_map_smem[smem_base + tk];
                   int node_local_eg = eg - node_rank * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE);
                   int target_rank = node_local_eg / NUM_OF_EXPERTS_PER_RANK;
                   int local_expert = node_local_eg % NUM_OF_EXPERTS_PER_RANK;
@@ -4376,6 +4435,24 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
 #endif
   cur_smem_t* smem_buffer_ptr = reinterpret_cast<cur_smem_t*>(smem_bytes);
 
+  // Direct-permute: compute pointers to extra SMEM region for direct metadata ping-pong buffers.
+  // Layout after cur_smem_t: [direct_write_map: 2 * chunk * TOPK * 4B] [topk_routing: 2 * chunk * TOPK * 2B] [mbarriers: 2 * 8B]
+  // These are nullptr when DIRECT_PERMUTE=false (no extra SMEM allocated).
+  int32_t* direct_write_map_smem = nullptr;
+  int16_t* direct_routing_map_smem = nullptr;
+  uint64_t* direct_meta_mbarrier = nullptr;
+  if constexpr(DIRECT_PERMUTE) {
+    constexpr int DWM_SIZE = 2 * NUM_OF_TOKENS_PER_CHUNK * TOPK * (int)sizeof(int32_t);
+    constexpr int DRM_SIZE = 2 * NUM_OF_TOKENS_PER_CHUNK * TOPK * (int)sizeof(int16_t);
+    // Align to 128B for TMA
+    constexpr int DWM_OFFSET = (sizeof(cur_smem_t) + 127) & ~127;
+    constexpr int DRM_OFFSET = (DWM_OFFSET + DWM_SIZE + 15) & ~15;
+    constexpr int MBAR_OFFSET = (DRM_OFFSET + DRM_SIZE + 7) & ~7;
+    direct_write_map_smem = reinterpret_cast<int32_t*>(smem_bytes + DWM_OFFSET);
+    direct_routing_map_smem = reinterpret_cast<int16_t*>(smem_bytes + DRM_OFFSET);
+    direct_meta_mbarrier = reinterpret_cast<uint64_t*>(smem_bytes + MBAR_OFFSET);
+  }
+
 #ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
   // When permute fusion is enabled, also need to declare the ptr for the smem for permute block.
   // Different types of blocks will use different ptr.
@@ -4421,9 +4498,14 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
       cuda::ptx::mbarrier_init(&smem_buffer_ptr->intra_node_mbarrier_buffer[i][0], 1);
       cuda::ptx::mbarrier_init(&smem_buffer_ptr->intra_node_mbarrier_buffer[i][1], INTRA_NODE_S2G_GROUP::warp_size());
     }
-    // Initialize sparse_to_dense map mbarrier.
-    cuda::ptx::mbarrier_init(&smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[0], 1);
-    cuda::ptx::mbarrier_init(&smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[1], 1);
+    // Initialize sparse_to_dense map / direct metadata mbarrier.
+    if constexpr(!DIRECT_PERMUTE) {
+      cuda::ptx::mbarrier_init(&smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[0], 1);
+      cuda::ptx::mbarrier_init(&smem_buffer_ptr->sparse_to_dense_map_mbarrier_buffer[1], 1);
+    } else {
+      cuda::ptx::mbarrier_init(&direct_meta_mbarrier[0], 1);
+      cuda::ptx::mbarrier_init(&direct_meta_mbarrier[1], 1);
+    }
     // Initialize S2G warp group mbarrier.
     cuda::ptx::mbarrier_init(&smem_buffer_ptr->S2G_group_mbarrier_buffer, INTRA_NODE_S2G_GROUP::warp_size());
     // Make mbarriers initialization visible to async proxy(TMA).
@@ -4464,7 +4546,8 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
       S2G_warp_group_device_function
       <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, FORWARD_DISPATCH, DIRECT_PERMUTE, TOPK>
       (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.sparse_to_dense_map, param.expert_output_token, param.expert_output_prob,
-      param.expert_output_scaling_factor, param.intra_node_expert_output_chunk_flags, smem_buffer_ptr, param.direct_write_map, param.topk_routing_map);
+      param.expert_output_scaling_factor, param.intra_node_expert_output_chunk_flags, smem_buffer_ptr, param.direct_write_map, param.topk_routing_map,
+      direct_write_map_smem, direct_routing_map_smem, direct_meta_mbarrier);
     }else{
       // Too many threads, should not goes here.
     }
@@ -4522,7 +4605,8 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
     S2G_warp_group_device_function
     <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, FORWARD_DISPATCH, DIRECT_PERMUTE, TOPK>
     (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.sparse_to_dense_map, param.expert_output_token, param.expert_output_prob,
-    param.expert_output_scaling_factor, param.intra_node_expert_output_chunk_flags, smem_buffer_ptr, param.direct_write_map, param.topk_routing_map);
+    param.expert_output_scaling_factor, param.intra_node_expert_output_chunk_flags, smem_buffer_ptr, param.direct_write_map, param.topk_routing_map,
+    direct_write_map_smem, direct_routing_map_smem, direct_meta_mbarrier);
   }else{
     // Too many threads, should not goes here.
   }
@@ -5856,10 +5940,21 @@ public:
 
     // Configure dynamic shared memory for the dispatch kernel.
 #ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
-    constexpr int SMEM_SIZE = sizeof(dispatch_kernel_smem_t) > sizeof(dispatch_kernel_permute_block_smem_t) ? sizeof(dispatch_kernel_smem_t) : sizeof(dispatch_kernel_permute_block_smem_t);
+    constexpr int BASE_SMEM_SIZE = sizeof(dispatch_kernel_smem_t) > sizeof(dispatch_kernel_permute_block_smem_t) ? sizeof(dispatch_kernel_smem_t) : sizeof(dispatch_kernel_permute_block_smem_t);
 #else
-    constexpr int SMEM_SIZE = sizeof(dispatch_kernel_smem_t);
+    constexpr int BASE_SMEM_SIZE = sizeof(dispatch_kernel_smem_t);
 #endif
+    // Direct-permute: allocate ping-pong buffer for direct_write_map [2][chunk_size * TOPK] int32
+    // + ping-pong buffer for topk_routing_map [2][chunk_size * TOPK] int16
+    // + 2 mbarriers (8B each)
+    // Placed after the base SMEM struct in the dynamic shared memory region.
+    constexpr int DIRECT_META_SMEM = DIRECT_PERMUTE ?
+        (2 * NUM_OF_TOKENS_PER_CHUNK * TOPK * (int)sizeof(int32_t)   // direct_write_map ping-pong
+       + 2 * NUM_OF_TOKENS_PER_CHUNK * TOPK * (int)sizeof(int16_t)   // topk_routing_map ping-pong
+       + 2 * (int)sizeof(uint64_t)                                    // mbarriers
+       + 128)                                                         // alignment padding
+        : 0;
+    constexpr int SMEM_SIZE = BASE_SMEM_SIZE + DIRECT_META_SMEM;
     CUDA_CHECK(cudaFuncSetAttribute(dispatch_kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE));
 
     // Launch update_expected_value_kernel to update expected flag value.
