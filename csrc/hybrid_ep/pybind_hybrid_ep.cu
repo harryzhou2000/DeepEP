@@ -170,7 +170,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("overflow_flag", &HandleImpl::overflow_flag)
         .def_readwrite("num_permuted_tokens", &HandleImpl::num_permuted_tokens)
         .def_readwrite("dense_chunk_layout", &HandleImpl::dense_chunk_layout)
-        .def_readwrite("dense_to_expert_map", &HandleImpl::dense_to_expert_map);
+        .def_readwrite("dense_to_expert_map", &HandleImpl::dense_to_expert_map)
+        .def_readwrite("direct_write_map", &HandleImpl::direct_write_map);
 
     pybind11::class_<HybridEPBuffer>(m, "HybridEPBuffer")
         .def(py::init<py::object, BufferConfig, int, int, int, std::string, bool, bool, bool>(),
@@ -213,7 +214,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("pad_multiple") = std::nullopt,
              py::arg("fuse_permute_dispatch") = false,
              py::arg("non_blocking") = false,
-             py::arg("with_probs") = false)
+             py::arg("with_probs") = false,
+             py::arg("direct_permute") = false,
+             py::arg("global_routing_map") = c10::nullopt)
         .def("combine_with_unpermute", &HybridEPBuffer::combine_with_unpermute, py::kw_only(),
              py::arg("hidden"),
              py::arg("probs") = c10::nullopt,

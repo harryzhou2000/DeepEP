@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved
 #include "hybrid_ep.cuh"
+#include "extension/direct_permute.cuh"
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -208,7 +209,10 @@ HybridEPBuffer::dispatch(
   }else {
     throw std::runtime_error("Invalid token data type:" +  std::to_string(static_cast<int>(config.token_data_type)));
   }
-  executor.dispatch_postprocess(config, args);
+  if(!direct_permute) {
+    executor.dispatch_postprocess(config, args);
+  }
+  // For direct_permute, data is already in args.local_expert_output_token/prob from dispatch_core
 
   return std::make_tuple(args.local_expert_output_token, args.local_expert_output_prob, args.local_expert_output_scaling_factor);
 }
@@ -273,7 +277,9 @@ HybridEPBuffer::dispatch_with_permute(
           c10::optional<int64_t> pad_multiple,
           bool fuse_permute_dispatch,
           bool non_blocking,
-          bool with_probs)
+          bool with_probs,
+          bool direct_permute,
+          c10::optional<torch::Tensor> global_routing_map)
 {
  auto config = handle.config;
  // Check the input tensors
@@ -327,6 +333,42 @@ HybridEPBuffer::dispatch_with_permute(
  
  // Run the full dispatch operation
  config.forward_dispatch_api = with_probs;
+ config.topk = handle.config.topk;
+
+ if(direct_permute) {
+   // Direct-permute path: compute addressing, zero output, dispatch directly to expert-grouped positions
+   assert(global_routing_map.has_value());
+   assert(handle.num_permuted_tokens >= 0);
+   args.direct_permute = true;
+   args.global_routing_map = global_routing_map.value();
+
+   // Compute direct_write_map using our 3-kernel pipeline
+   auto [dw_map, tpe, padded_tpe, overflow] = compute_direct_write_map(
+       global_routing_map.value(),
+       handle.num_of_tokens_per_rank,
+       config.num_of_ranks_per_node,
+       config.num_of_experts_per_rank,
+       config.topk,
+       args.pad_multiple,
+       executor.get_local_rank(),
+       executor.get_node_rank(),
+       handle.num_permuted_tokens);
+   args.direct_write_map = dw_map;
+   handle.direct_write_map = dw_map;
+   handle.tokens_per_expert = tpe;
+   handle.padded_tokens_per_expert = padded_tpe.to(torch::kInt64);
+   handle.overflow_flag = overflow;
+
+   // Zero the output buffers (padding positions must be zero)
+   cudaMemsetAsync(args.local_expert_output_token.data_ptr(), 0,
+       handle.num_permuted_tokens * config.hidden_dim * c10::elementSize(hidden.scalar_type()),
+       args.stream);
+   if(with_probs) {
+     cudaMemsetAsync(args.local_expert_output_prob.value().data_ptr(), 0,
+         handle.num_permuted_tokens * sizeof(float), args.stream);
+   }
+ }
+
  executor.dispatch_preprocess(config, args);
  if(config.token_data_type == APP_TOKEN_DATA_TYPE::UINT8) {
    executor.dispatch_core<uint8_t>(config, args);

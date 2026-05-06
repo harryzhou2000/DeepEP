@@ -55,7 +55,9 @@ public:
             c10::optional<int64_t> pad_multiple,
             bool fuse_permute_dispatch,
             bool non_blocking,
-            bool with_probs);
+            bool with_probs,
+            bool direct_permute = false,
+            c10::optional<torch::Tensor> global_routing_map = c10::nullopt);
 
   std::tuple<torch::Tensor, torch::Tensor>
   combine_with_unpermute(

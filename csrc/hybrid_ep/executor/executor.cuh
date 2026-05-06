@@ -165,6 +165,12 @@ private:
     int node_rank;
     bool enable_custom_allgather;
 
+public:
+    int get_local_rank() const { return local_rank; }
+    int get_node_rank() const { return node_rank; }
+
+private:
+
     // Buffers for intra-node communication
     IntraNodeDispatchBuffers *intra_node_dispatch_buffers = nullptr;
     IntraNodeCombineBuffers *intra_node_combine_buffers = nullptr;
