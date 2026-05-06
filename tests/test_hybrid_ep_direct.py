@@ -72,8 +72,13 @@ def test_direct_dispatch(buffer, group):
         HIDDEN_DIM, NUM_TOKENS_PER_RANK, TOPK, num_experts
     )
     # Encode unique global token ID in first 4 elements using base-16 digits.
-    # Each component is in [0, 15], safe for any numeric format (bf16, fp8, mxfp8).
+    # Each component is in [0, 15], safe for any numeric format (bf16, fp8/e4m3, mxfp8).
     # Supports up to 16^4 = 65536 unique tokens total.
+    #
+    # WARNING: For mxfp4/nvfp4 (4-bit formats), representable values are extremely
+    # limited (~16 distinct values). This encoding would need to use more elements
+    # (e.g., 16 elements × base-2) or switch to a 2^16-encoding scheme where each
+    # element is 0 or 1 and the full ID is reconstructed from 16 binary digits.
     global_offset = rank * NUM_TOKENS_PER_RANK
     for i in range(NUM_TOKENS_PER_RANK):
         gid = global_offset + i
