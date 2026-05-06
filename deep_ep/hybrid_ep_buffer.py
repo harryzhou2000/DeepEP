@@ -345,6 +345,9 @@ class HybridEPBuffer:
         non_blocking: bool = False,
         fuse_permute_dispatch: bool = False,
         dense_routing: bool = False,
+        # Direct-permute: S2G writes directly to expert-grouped positions
+        direct_permute: bool = False,
+        global_routing_map: torch.Tensor = None,
         # Deprecated parameters
         num_dispatched_tokens: int = None,
         use_host_meta: bool = None,
@@ -352,6 +355,7 @@ class HybridEPBuffer:
         """
         Dispatch the data to the experts with permute.
         When dense_routing=True, topk_idx is passed directly as int16 (skipping indices_to_map).
+        When direct_permute=True, S2G writes directly to expert-grouped buffer (skipping staging + permute kernel).
         """
         if num_dispatched_tokens is not None:
             warnings.warn("The num_dispatched_tokens is deprecated, it will be removed in the future.")
@@ -463,6 +467,8 @@ class HybridEPBuffer:
                 fuse_permute_dispatch=fuse_permute_dispatch,
                 non_blocking=non_blocking,
                 with_probs=probs is not None,
+                direct_permute=direct_permute,
+                global_routing_map=global_routing_map,
             )
         
         if fuse_permute_dispatch:
