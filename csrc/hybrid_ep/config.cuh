@@ -524,5 +524,29 @@ public:
             fflush(stderr);
             throw std::runtime_error("Cannot fit kernels into shared memory even with minimum stages.");
         }
+
+        // 7. Print final config if requested.
+        if (get_env_int("HYBRID_EP_DEBUG_JIT_CONFIG", 0)) {
+            char buf[1024];
+            snprintf(buf, sizeof(buf),
+                "[hybrid-ep config] H=%d, E=%d, R=%d, N=%d, max_tokens=%d\n"
+                "  dispatch: stages=%d, permute_stages=%d, in_flight_s2g=%d, chunk=%d, blocks=%d\n"
+                "  combine:  g2s_stages=%d, s2g_stages=%d, reduce_batch=%d, chunk=%d, group=%d, blocks=%d\n"
+                "  combine unpermute: g2s_stages=%d, s2g_stages=%d\n"
+                "  smem: dispatch=%ld B, combine=%ld B, device_max=%d B\n",
+                config.hidden_dim, config.num_of_experts_per_rank, config.num_of_ranks_per_node,
+                config.num_of_nodes, config.max_num_of_tokens_per_rank,
+                config.num_of_stages_dispatch_api, config.num_of_stages_permute_block_dispatch_api,
+                config.num_of_in_flight_s2g_dispatch_api, config.num_of_tokens_per_chunk_dispatch_api,
+                config.num_of_blocks_dispatch_api,
+                config.num_of_stages_g2s_combine_api, config.num_of_stages_s2g_combine_api,
+                config.num_tokens_combine_reduce_batch,
+                config.num_of_tokens_per_chunk_combine_api, config.num_of_tokens_per_group_combine_api,
+                config.num_of_blocks_combine_api,
+                config.num_of_stages_g2s_unpermute_block, config.num_of_stages_s2g_unpermute_block,
+                (long)final_dispatch, (long)final_combine, max_smem);
+            fprintf(stderr, "%s", buf);
+            fflush(stderr);
+        }
     }
 };
