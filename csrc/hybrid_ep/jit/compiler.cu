@@ -135,7 +135,7 @@ std::string NVCCCompiler::build(std::string code, std::string signature, int loc
     return output_path;
 }
 
-std::any NVCCCompiler::get_instance(std::string library_path, std::string kernel_key) {
+std::any NVCCCompiler::get_instance(std::string library_path, std::string kernel_key, bool skip_rename) {
     // Open the compiled library with RTLD_LOCAL to avoid symbol conflicts
     // between JIT-compiled templates (e.g. with HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE)
     // and the same template instantiated in the main module (without the macro).
@@ -155,16 +155,19 @@ std::any NVCCCompiler::get_instance(std::string library_path, std::string kernel
                                 library_path);
     }
 
-    // Unique the compiled lib from different rank
-    std::string unique_library_path = jit_dir + "/" + kernel_key + ".so";
-    if (library_path != unique_library_path) {
-        std::error_code ec;
-        std::filesystem::rename(library_path, unique_library_path, ec); 
-        if (ec) {
-            // If rename failed, the comm should not be blocked, so we just print a warning message
-            printf("[Warning] Failed to unique the library: %s -> %s, err: %s\n",
-                   library_path.c_str(), unique_library_path.c_str(), ec.message().c_str());
-            std::filesystem::remove(library_path, ec); // best-effort cleanup
+    // Unique the compiled lib from different rank (skip when loading from cache
+    // to avoid moving .so files out of other proc-* directories).
+    if (!skip_rename) {
+        std::string unique_library_path = jit_dir + "/" + kernel_key + ".so";
+        if (library_path != unique_library_path) {
+            std::error_code ec;
+            std::filesystem::rename(library_path, unique_library_path, ec); 
+            if (ec) {
+                // If rename failed, the comm should not be blocked, so we just print a warning message
+                printf("[Warning] Failed to unique the library: %s -> %s, err: %s\n",
+                       library_path.c_str(), unique_library_path.c_str(), ec.message().c_str());
+                std::filesystem::remove(library_path, ec); // best-effort cleanup
+            }
         }
     }
 
@@ -249,6 +252,36 @@ node_rank(node_rank), local_rank(local_rank), nvcc_compiler(base_path, comm_id) 
     jit_dir = get_jit_dir();
     std::filesystem::create_directories(jit_dir);
     if(load_cached_kernels) {
+        // Cross-PID cache loading for ncu mode: scan ALL proc-* subdirectories
+        // (not just current PID) to reuse kernels compiled by a previous run.
+        //
+        // After a normal run, get_instance() renames .so files from
+        //   "<key>-rank-<r>-node-<n>-<ts>-<comm_id>.so"  to  "<key>.so"
+        // So most cached files are already named "<key>.so" (stem == key).
+        // For un-renamed intermediates, strip the "-rank-..." suffix.
+        std::string base_jit = std::filesystem::path(jit_dir).parent_path().string();
+        for (const auto& proc_dir : std::filesystem::directory_iterator(base_jit)) {
+            if (!proc_dir.is_directory()) continue;
+            for (const auto& entry : std::filesystem::directory_iterator(proc_dir)) {
+                if (entry.path().extension() != ".so") continue;
+                std::string stem = entry.path().stem().string();
+                std::string kernel_key;
+                auto rank_pos = stem.find("-rank-");
+                if (rank_pos != std::string::npos) {
+                    kernel_key = stem.substr(0, rank_pos);
+                } else {
+                    kernel_key = stem;
+                }
+                if (kernel_cache.find(kernel_key) != kernel_cache.end()) continue;
+                try {
+                    kernel_cache[kernel_key] = nvcc_compiler.get_instance(entry.path().string(), kernel_key, /*skip_rename=*/true);
+                } catch (...) {
+                    // Ignore stale or incompatible .so files
+                }
+            }
+        }
+    } else {
+        // Default: load only from current PID's directory (original behavior).
         for (const auto& entry : std::filesystem::directory_iterator(jit_dir)) {
             if (entry.path().extension() == ".so") {
                 std::string kernel_key = entry.path().stem().string();
