@@ -153,6 +153,7 @@ struct HybridEpConfigInstance {
   int num_of_blocks_combine_api;
   int num_of_additional_in_flight_s2g_combine_api;
   int num_of_additional_in_flight_s2g_unpermute_block_combine_api;
+  int num_tokens_combine_reduce_batch = 1;
   bool backward_combine_api;
   bool device_side_sync_combine_api = true;
 
@@ -451,6 +452,9 @@ public:
         config.num_of_tokens_per_group_combine_api = get_env_int("NUM_OF_TOKENS_PER_GROUP_COMBINE_API", 4);
         config.num_of_additional_in_flight_s2g_combine_api = get_env_int("NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_COMBINE_API", 2);
         config.num_of_additional_in_flight_s2g_unpermute_block_combine_api = get_env_int("NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_UNPERMUTE_BLOCK_COMBINE_API", 2);
+        // Batch size for combine reduction. Default 1 keeps the original
+        // per-source waits; set 0 for auto (half the per-pipeline G2S depth).
+        config.num_tokens_combine_reduce_batch = get_env_int("NUM_TOKENS_COMBINE_REDUCE_BATCH_COMBINE_API", 1);
         
         config.pad_multiple = 1;
         config.topk = 0;  // default: sparse bool routing map
@@ -559,7 +563,16 @@ public:
                         config.num_of_stages_s2g_unpermute_block);
         }
 
-        // 5. Final validation
+        // 5. Resolve combine reduce batch size.
+        // NUM_OF_DATA_PIPELINE_PER_BLOCK is 2 for single-node, 1 for multi-node.
+        int num_pipelines = (config.num_of_nodes > 1) ? 1 : 2;
+        int stages_per_pipeline = config.num_of_stages_g2s_combine_api / num_pipelines;
+        if (config.num_tokens_combine_reduce_batch <= 0) {
+            config.num_tokens_combine_reduce_batch = std::max(1, stages_per_pipeline / 2);
+        }
+        config.num_tokens_combine_reduce_batch = std::min(config.num_tokens_combine_reduce_batch, stages_per_pipeline);
+
+        // 6. Final validation
         int64_t final_dispatch = dispatch_smem();
         int64_t final_combine = combine_smem();
         if (final_dispatch > max_smem || final_combine > max_smem) {
