@@ -256,6 +256,7 @@ std::string NVCCCompiler::get_combine_code(HybridEpConfigInstance config) {
          std::to_string(config.num_of_blocks_combine_api) + ", " + std::to_string(config.num_of_blocks_unpermute) + ", " +
          std::to_string(config.num_of_additional_in_flight_s2g_combine_api) + ", " +
          std::to_string(config.num_of_additional_in_flight_s2g_unpermute_block_combine_api) + ", " +
+         std::to_string(config.num_tokens_combine_reduce_batch) + ", " +
          (config.backward_combine_api ? "true" : "false") + ", " +
          (config.device_side_sync_combine_api ? "true" : "false") + R"(>;
             return func_ptr;
@@ -434,6 +435,7 @@ void KernelCache::run_combine_kernel(
         config.num_of_blocks_unpermute,
         config.num_of_additional_in_flight_s2g_combine_api,
         config.num_of_additional_in_flight_s2g_unpermute_block_combine_api,
+        config.num_tokens_combine_reduce_batch,
         config.backward_combine_api,
         config.device_side_sync_combine_api,
         fuse_unpermute_combine,
@@ -456,4 +458,3 @@ void KernelCache::run_combine_kernel(
     // Run the kernel
     func_ptr(param, stream);
 }
-
