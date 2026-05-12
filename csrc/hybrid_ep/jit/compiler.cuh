@@ -51,7 +51,7 @@ public:
     * @param kernel_key The key of the kernel, used to cache the compiled function pointer
     * @return std::any The function pointer
     */
-    std::any get_instance(std::string library_path, std::string kernel_key);
+    std::any get_instance(std::string library_path, std::string kernel_key, bool skip_rename = false);
 
 
 private:
