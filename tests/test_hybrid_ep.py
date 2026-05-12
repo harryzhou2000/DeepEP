@@ -538,11 +538,16 @@ def test_hybrid_ep_benchmark(buffer: deep_ep.HybridEPBuffer, group: dist.Process
 
 
 def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+    # When running under ncu, extend NCCL timeout to avoid timeouts during kernel replay
+    if os.environ.get('DEEP_EP_NCU_MODE') == '1':
+        os.environ.setdefault('NCCL_TIMEOUT', '1800')  # 30 min
+
     _, _, group = init_dist(local_rank, num_local_ranks)
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        fp8_modes = [False] if args.only_bf16 else [False, True]
+        ncu_mode = os.environ.get('DEEP_EP_NCU_MODE') == '1'
+        fp8_modes = [False] if ncu_mode or args.only_bf16 else [False, True]
         for use_fp8 in fp8_modes:
             buffer = deep_ep.HybridEPBuffer(
                 group=group,
@@ -554,6 +559,7 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 num_sms_combine_api=NUM_SMS_COMBINE,
                 num_blocks_permute=NUM_BLOCKS_PERMUTE,
                 num_blocks_unpermute=NUM_BLOCKS_UNPERMUTE,
+                load_cached_kernels=ncu_mode,
             )
 
             # Set missing global vars - use buffer's detected values
@@ -574,7 +580,72 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             )
 
             test_hybrid_ep_correctness(buffer, ref, use_fp8)
-            test_hybrid_ep_benchmark(buffer, group, use_fp8, args.nsys_profile)
+            if ncu_mode:
+                # NCU profiling mode: run warmup + one profiled iteration.
+                # The profiled operation depends on --ncu-kernel:
+                #   dispatch_kernel → fused dispatch+permute
+                #   combine_kernel  → fused combine+unpermute (default)
+                NCU_WARMUP = 3
+                ncu_kernel = os.environ.get('NCU_KERNEL_TARGET', 'combine_kernel')
+                ncu_fused = os.environ.get('NCU_FUSED', '0') == '1'
+                hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights = (
+                    init_tensor(HIDDEN_DIM, NUM_TOKENS_PER_RANK, TOPK, NUM_OF_EXPERTS, use_fp8)
+                )
+
+                if 'dispatch' in ncu_kernel:
+                    # Profile dispatch (fused or standalone)
+                    dispatch_args = dict(
+                        hidden=hidden, routing_map=routing_map, probs=probs,
+                        scaling_factor=scaling_factor, pad_multiple=PAD_MULTIPLE,
+                        fuse_permute_dispatch=ncu_fused,
+                    )
+                    del topk_idx, topk_weights
+                    torch.cuda.empty_cache()
+                    for _ in range(NCU_WARMUP):
+                        buffer.dispatch_with_permute(**dispatch_args)
+                        torch.cuda.synchronize()
+                    dist.barrier()
+                    torch.cuda.cudart().cudaProfilerStart()
+                    buffer.dispatch_with_permute(**dispatch_args)
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStop()
+                    dist.barrier()
+                    if dist.get_rank() == 0:
+                        label = 'fused dispatch+permute' if ncu_fused else 'standalone dispatch'
+                        print(f'  [ncu] profiled {label}', flush=True)
+                else:
+                    # Profile combine (fused or standalone)
+                    (
+                        dispatched_hidden, dispatched_probs, dispatched_scaling_factor,
+                        tokens_per_expert, handle,
+                    ) = buffer.dispatch_with_permute(
+                        hidden=hidden, routing_map=routing_map, probs=probs,
+                        scaling_factor=scaling_factor, pad_multiple=PAD_MULTIPLE,
+                        fuse_permute_dispatch=ncu_fused,
+                    )
+                    dispatched_hidden = dispatched_hidden.to(torch.bfloat16)
+                    combine_args = dict(
+                        hidden=dispatched_hidden, probs=dispatched_probs,
+                        handle=handle, pad_multiple=PAD_MULTIPLE,
+                        fuse_unpermute_combine=ncu_fused,
+                    )
+                    del hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights
+                    del dispatched_scaling_factor, tokens_per_expert
+                    torch.cuda.empty_cache()
+                    for _ in range(NCU_WARMUP):
+                        buffer.combine_with_unpermute(**combine_args)
+                        torch.cuda.synchronize()
+                    dist.barrier()
+                    torch.cuda.cudart().cudaProfilerStart()
+                    buffer.combine_with_unpermute(**combine_args)
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStop()
+                    dist.barrier()
+                    if dist.get_rank() == 0:
+                        label = 'fused combine+unpermute' if ncu_fused else 'standalone combine'
+                        print(f'  [ncu] profiled {label}', flush=True)
+            else:
+                test_hybrid_ep_benchmark(buffer, group, use_fp8, args.nsys_profile)
     dist.barrier()
     dist.destroy_process_group()
 
@@ -586,5 +657,110 @@ if __name__ == "__main__":
                        help='benchmark with nsys profile or not (default: False)')
     parser.add_argument('--only-bf16', action='store_true', default=False,
                        help='Skip FP8 tests, only run BF16 (default: False)')
+    parser.add_argument('--local-rank', type=int, default=None,
+                       help=argparse.SUPPRESS)
+    parser.add_argument('--ncu-profile', type=str, default=None, metavar='OUTPUT_PATH',
+                       help='Profile with ncu, saving report to OUTPUT_PATH. '
+                            'Re-launches self under ncu with --target-processes all.')
+    parser.add_argument('--ncu-kernel', type=str, default='combine_kernel',
+                       help='Kernel name regex for ncu (default: combine_kernel)')
+    parser.add_argument('--ncu-metrics', type=str, default=None,
+                       help='Comma-separated ncu metrics (default: stall breakdown)')
+    parser.add_argument('--ncu-fused', action='store_true', default=False,
+                       help='Profile the fused variant (dispatch+permute or combine+unpermute)')
+    parser.add_argument('--ncu-child', action='store_true', default=False,
+                       help=argparse.SUPPRESS)  # Internal flag: we are already running under ncu
     args = parser.parse_args()
-    torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)
+
+    if args.ncu_profile is not None and not args.ncu_child:
+        # Collective ncu profiling: ALL ranks run under their own ncu instance.
+        # ncu instances coordinate via --communicator tcp and synchronize kernel
+        # replay with --lockstep-kernel-launch, so collective kernels replay
+        # correctly across all ranks simultaneously.
+        import subprocess, sys
+        ncu_metrics = args.ncu_metrics or ','.join([
+            # Timing
+            'gpu__time_duration.sum',
+            # Warp occupancy
+            'sm__warps_active.avg.pct_of_peak_sustained_active',
+            # Warp stall breakdown
+            'smsp__warp_issue_stalled_barrier_per_warp_active.pct',
+            'smsp__warp_issue_stalled_membar_per_warp_active.pct',
+            'smsp__warp_issue_stalled_wait_per_warp_active.pct',
+            'smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct',
+            'smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct',
+            'smsp__warp_issue_stalled_not_selected_per_warp_active.pct',
+            'smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct',
+            'smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct',
+            'smsp__warp_issue_stalled_misc_per_warp_active.pct',
+            # NVLink traffic (bytes)
+            'nvlrx__bytes.sum',
+            'nvltx__bytes.sum',
+            'nvlrx__bytes_data_user.sum',
+            'nvltx__bytes_data_user.sum',
+            # NVLink throughput (% of peak)
+            'nvlrx__throughput.avg.pct_of_peak_sustained_elapsed',
+            'nvltx__throughput.avg.pct_of_peak_sustained_elapsed',
+            # DRAM traffic
+            'dram__bytes_read.sum',
+            'dram__bytes_write.sum',
+            # L1/SMEM
+            'l1tex__t_sectors_pipe_lsu.sum',
+            'l1tex__t_sectors_pipe_lsu_lookup_miss.sum',
+            # SM throughput
+            'sm__throughput.avg.pct_of_peak_sustained_elapsed',
+        ])
+
+        env = os.environ.copy()
+        env['DEEP_EP_NCU_MODE'] = '1'
+        env['NCU_KERNEL_TARGET'] = args.ncu_kernel
+        env['NCU_FUSED'] = '1' if args.ncu_fused else '0'
+        env['MASTER_ADDR'] = '127.0.0.1'
+        env['MASTER_PORT'] = str(29500 + os.getpid() % 1000)
+        # init_dist treats WORLD_SIZE as num_nodes, RANK as node_rank.
+        # Single-node: WORLD_SIZE=1, RANK=0 → total = 1 * num_local_ranks.
+        env['WORLD_SIZE'] = '1'
+        env['RANK'] = '0'
+        env['NCCL_TIMEOUT'] = '1800'  # 30 min for ncu slowdown
+
+        num_peers = args.num_processes
+        procs = []
+        for rank in range(num_peers):
+            base_cmd = [
+                sys.executable, __file__,
+                '--local-rank', str(rank),
+                '--num-processes', str(num_peers),
+                '--ncu-child',
+            ]
+            # Every rank runs under ncu with collective coordination
+            cmd = [
+                'ncu',
+                '--profile-from-start', 'off',
+                '--communicator', 'tcp',
+                '--communicator-tcp-num-peers', str(num_peers),
+                '--communicator-tcp-hostname', '127.0.0.1',
+                '--lockstep-kernel-launch',
+                '--kernel-name', args.ncu_kernel,
+                '--launch-count', '1',
+                '--metrics', ncu_metrics,
+                '-o', f'{args.ncu_profile}_rank{rank}', '-f',
+            ] + base_cmd
+            procs.append(subprocess.Popen(cmd, env=env))
+
+        # Wait for all
+        rc = 0
+        for p in procs:
+            p.wait()
+            if p.returncode != 0:
+                rc = p.returncode
+        if rc != 0:
+            print(f'[ncu-launcher] Some ranks failed with rc={rc}', flush=True)
+        sys.exit(rc)
+    elif args.local_rank is not None:
+        # Single-process mode
+        test_main(args.local_rank, args.num_processes, args)
+    else:
+        # Multi-process mode (normal or under ncu via --ncu-child)
+        if args.ncu_child:
+            os.environ['DEEP_EP_NCU_MODE'] = '1'
+        torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)
