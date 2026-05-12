@@ -2,10 +2,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 #include "permute.cuh"
+#include <cstdlib>
 
  template void permute_launcher<uint16_t, float, float>(PermuteArgs args);
  template void permute_launcher<uint8_t, float, float>(PermuteArgs args);
- 
+
  template void unpermute_launcher<uint16_t, float>(UnpermuteArgs args);
 
  // Pad each element of tokens_per_expert to nearest multiple of pad_multiple.
@@ -303,7 +304,7 @@
  
 
  template <const int block_size = 512, typename DType, typename ProbType, typename ScalarType>
- __global__ void permute_kernel(DType* tokens,
+ __global__ void permute_kernel_reference(DType* tokens,
                                 DType* permuted_tokens,
                                 ScalarType* scaling_factor,
                                 ScalarType* permuted_scaling_factor,
@@ -391,6 +392,100 @@
     __syncthreads();
    }
  }
+
+// ============================================================================
+// Optimized standalone permute kernel.
+//
+// The original kernel scans every local expert slot for every token. This
+// version builds 32-wide ballot masks and iterates only active entries. For
+// E_per_rank > 32, it walks multiple 32-expert chunks.
+// ============================================================================
+
+template <int THREADS_PER_TOKEN, const int block_size = 512,
+          typename DType, typename ProbType, typename ScalarType>
+__global__ void permute_kernel(DType* tokens,
+                               DType* permuted_tokens,
+                               ScalarType* scaling_factor,
+                               ScalarType* permuted_scaling_factor,
+                               ProbType* probs,
+                               ProbType* permuted_probs,
+                               int* row_id_map,
+                               int* num_dispatched_tokens_ptr,
+                               int pad_multiple,
+                               int num_of_local_experts,
+                               int hidden_size,
+                               int scales_per_token,
+                               int local_rank,
+                               int num_ranks_per_node) {
+   static_assert(THREADS_PER_TOKEN == 32 || THREADS_PER_TOKEN == 64 || THREADS_PER_TOKEN == 128,
+                 "THREADS_PER_TOKEN must be 32, 64, or 128");
+   constexpr int tokens_per_block = block_size / THREADS_PER_TOKEN;
+   int group_id = threadIdx.x / THREADS_PER_TOKEN;
+   int group_lane = threadIdx.x % THREADS_PER_TOKEN;
+   int lane_in_warp = group_lane % 32;
+   int num_dispatched_tokens = *num_dispatched_tokens_ptr + pad_multiple;
+
+   int num_eles_per_float4 = sizeof(float4) / sizeof(DType);
+   int64_t hidden_size_fp4 = hidden_size / num_eles_per_float4;
+   float4* tokens_fp4 = reinterpret_cast<float4*>(tokens);
+   float4* permuted_tokens_fp4 = reinterpret_cast<float4*>(permuted_tokens);
+
+   for (int64_t token_id = static_cast<int64_t>(blockIdx.x) * tokens_per_block + group_id;
+        token_id < num_dispatched_tokens;
+        token_id += static_cast<int64_t>(gridDim.x) * tokens_per_block) {
+     int* token_routing = row_id_map + token_id * num_of_local_experts;
+
+     for (int expert_base = 0; expert_base < num_of_local_experts; expert_base += 32) {
+       int expert_idx = expert_base + lane_in_warp;
+       int my_dest = (expert_idx < num_of_local_experts) ? token_routing[expert_idx] : 0;
+       unsigned positive_mask = __ballot_sync(0xFFFFFFFF, my_dest > 0);
+       unsigned negative_mask = __ballot_sync(0xFFFFFFFF, my_dest < 0);
+
+       unsigned pos = positive_mask;
+       while (pos) {
+         int e = __ffs(pos) - 1;
+         pos &= pos - 1;
+         int expert_id = expert_base + e;
+         int dest_id = __shfl_sync(0xFFFFFFFF, my_dest, e);
+
+         for (int64_t j = group_lane; j < hidden_size_fp4; j += THREADS_PER_TOKEN) {
+           permuted_tokens_fp4[(dest_id - 1) * hidden_size_fp4 + j] =
+               tokens_fp4[token_id * hidden_size_fp4 + j];
+         }
+         if (scaling_factor != nullptr) {
+           for (int64_t j = group_lane; j < scales_per_token; j += THREADS_PER_TOKEN) {
+             permuted_scaling_factor[(dest_id - 1) * scales_per_token + j] =
+                 scaling_factor[token_id * scales_per_token + j];
+           }
+         }
+         if (probs != nullptr && group_lane == 0) {
+           permuted_probs[dest_id - 1] =
+               probs[token_id * num_of_local_experts * num_ranks_per_node +
+                     local_rank * num_of_local_experts + expert_id];
+         }
+       }
+
+       unsigned neg = negative_mask;
+       while (neg) {
+         int e = __ffs(neg) - 1;
+         neg &= neg - 1;
+         int dest_id = __shfl_sync(0xFFFFFFFF, my_dest, e);
+
+         for (int64_t j = group_lane; j < hidden_size_fp4; j += THREADS_PER_TOKEN) {
+           permuted_tokens_fp4[(-dest_id - 1) * hidden_size_fp4 + j] = {0.0f, 0.0f, 0.0f, 0.0f};
+         }
+         if (scaling_factor != nullptr) {
+           for (int64_t j = group_lane; j < scales_per_token; j += THREADS_PER_TOKEN) {
+             permuted_scaling_factor[(-dest_id - 1) * scales_per_token + j] = 0;
+           }
+         }
+         if (probs != nullptr && group_lane == 0) {
+           permuted_probs[-dest_id - 1] = 0;
+         }
+       }
+     }
+   }
+}
  
  template <typename DType, typename ProbType = float, typename ScalarType = float>
  void permute_launcher( PermuteArgs args) {
@@ -408,37 +503,70 @@
       assert(args.hidden_size % 8 == 0);
    }
    assert(args.num_permuted_token >= 0);
+   assert(args.num_of_local_experts <= 256);
    // No tokens to permute — skip kernel launch
    if(args.num_permuted_token == 0) return;
    // Output buffers must be pre-allocated by caller
    assert(args.output_tokens_ptr != nullptr);
  
-   // Launch the kernel
+   const char* ref_env = std::getenv("HYBRID_EP_USE_PERMUTE_REFERENCE");
+   bool use_reference = ref_env && (ref_env[0] == '1');
+
    constexpr int block_size = 512;
-   constexpr int tokens_per_block = block_size / 128;
    int grid_size = args.num_of_blocks_permute;
-   int shared_mem_size = args.num_of_local_experts * tokens_per_block * sizeof(int);
-   permute_kernel<<<grid_size, block_size, shared_mem_size, args.stream>>>(
-       reinterpret_cast<DType*>(tokens_ptr),
-       reinterpret_cast<DType*>(args.output_tokens_ptr),
-       args.use_fp8 ? reinterpret_cast<float*>(args.scaling_factor_ptr) : nullptr,
-       args.use_fp8 ? reinterpret_cast<float*>(args.output_scaling_factor_ptr) : nullptr,
-       args.with_probs ? reinterpret_cast<float*>(args.probs_ptr) : nullptr,
-       args.with_probs ? reinterpret_cast<float*>(args.output_probs_ptr) : nullptr, 
-       args.row_id_map.data_ptr<int>(),
-       args.num_dispatched_token_tensor.data_ptr<int>(), 
-       args.pad_multiple, 
-       args.num_of_local_experts, 
-       args.hidden_size,
-       args.scales_per_token, 
-       args.local_rank, 
-       args.num_ranks_per_node
-    );
+   int hidden_size_fp4 = args.hidden_size / static_cast<int>(sizeof(float4) / sizeof(DType));
+
+   if (use_reference) {
+     constexpr int tokens_per_block = block_size / 128;
+     int shared_mem_size = args.num_of_local_experts * tokens_per_block * sizeof(int);
+     permute_kernel_reference<<<grid_size, block_size, shared_mem_size, args.stream>>>(
+         reinterpret_cast<DType*>(tokens_ptr),
+         reinterpret_cast<DType*>(args.output_tokens_ptr),
+         args.use_fp8 ? reinterpret_cast<float*>(args.scaling_factor_ptr) : nullptr,
+         args.use_fp8 ? reinterpret_cast<float*>(args.output_scaling_factor_ptr) : nullptr,
+         args.with_probs ? reinterpret_cast<float*>(args.probs_ptr) : nullptr,
+         args.with_probs ? reinterpret_cast<float*>(args.output_probs_ptr) : nullptr,
+         args.row_id_map.data_ptr<int>(),
+         args.num_dispatched_token_tensor.data_ptr<int>(),
+         args.pad_multiple,
+         args.num_of_local_experts,
+         args.hidden_size,
+         args.scales_per_token,
+         args.local_rank,
+         args.num_ranks_per_node
+      );
+   } else {
+     #define PERMUTE_LAUNCH(TPT) \
+       permute_kernel<TPT, block_size><<<grid_size, block_size, 0, args.stream>>>( \
+           reinterpret_cast<DType*>(tokens_ptr), \
+           reinterpret_cast<DType*>(args.output_tokens_ptr), \
+           args.use_fp8 ? reinterpret_cast<float*>(args.scaling_factor_ptr) : nullptr, \
+           args.use_fp8 ? reinterpret_cast<float*>(args.output_scaling_factor_ptr) : nullptr, \
+           args.with_probs ? reinterpret_cast<float*>(args.probs_ptr) : nullptr, \
+           args.with_probs ? reinterpret_cast<float*>(args.output_probs_ptr) : nullptr, \
+           args.row_id_map.data_ptr<int>(), \
+           args.num_dispatched_token_tensor.data_ptr<int>(), \
+           args.pad_multiple, \
+           args.num_of_local_experts, \
+           args.hidden_size, \
+           args.scales_per_token, \
+           args.local_rank, \
+           args.num_ranks_per_node)
+
+     if (hidden_size_fp4 <= 64) {
+       PERMUTE_LAUNCH(32);
+     } else if (hidden_size_fp4 <= 128) {
+       PERMUTE_LAUNCH(64);
+     } else {
+       PERMUTE_LAUNCH(128);
+     }
+     #undef PERMUTE_LAUNCH
+   }
    CUDA_CHECK(cudaGetLastError());
  }
  
  template <const int block_size = 512, typename DType, typename ProbType>
- __global__ void unpermute_kernel(DType* permuted_tokens,
+ __global__ void unpermute_kernel_reference(DType* permuted_tokens,
                                   DType* tokens,
                                   ProbType* permuted_probs,
                                   ProbType* probs,
@@ -522,6 +650,111 @@
     __syncthreads();
   }
  }
+
+// ============================================================================
+// Optimized standalone unpermute kernel.
+//
+// Token accumulation iterates only active source experts using 32-wide ballot
+// masks. E_per_rank > 32 is handled by processing multiple expert chunks.
+// ============================================================================
+
+ template <const int THREADS_PER_TOKEN, bool MULTI_CHUNK, const int block_size,
+           typename DType, typename ProbType>
+ __global__ void unpermute_kernel(DType* permuted_tokens,
+                                  DType* tokens,
+                                  ProbType* permuted_probs,
+                                  ProbType* probs,
+                                  int* row_id_map,
+                                  int* num_dispatched_tokens_ptr,
+                                  int num_of_local_experts,
+                                  int hidden_size,
+                                  int local_rank,
+                                  int num_ranks_per_node) {
+   static_assert(THREADS_PER_TOKEN == 32 || THREADS_PER_TOKEN == 64 || THREADS_PER_TOKEN == 128,
+                 "THREADS_PER_TOKEN must be 32, 64, or 128");
+   constexpr int tokens_per_block = block_size / THREADS_PER_TOKEN;
+   constexpr int max_expert_chunks = 8;  // permute_preprocessing supports up to 256 local experts.
+   int group_id = threadIdx.x / THREADS_PER_TOKEN;
+   int group_lane = threadIdx.x % THREADS_PER_TOKEN;
+   int lane_in_warp = group_lane % 32;
+   int num_dispatched_tokens = *num_dispatched_tokens_ptr;
+   int num_expert_chunks = (num_of_local_experts + 31) / 32;
+
+   constexpr int num_eles_per_float4 = sizeof(float4) / sizeof(DType);
+   int64_t hidden_size_fp4 = hidden_size / num_eles_per_float4;
+   float4* tokens_fp4 = reinterpret_cast<float4*>(tokens);
+   float4* permuted_tokens_fp4 = reinterpret_cast<float4*>(permuted_tokens);
+
+   for (int64_t token_id = static_cast<int64_t>(blockIdx.x) * tokens_per_block + group_id;
+        token_id < num_dispatched_tokens;
+        token_id += static_cast<int64_t>(gridDim.x) * tokens_per_block) {
+     int* token_routing = row_id_map + token_id * num_of_local_experts;
+
+     int my_src = 0;
+     unsigned active_mask = 0;
+     unsigned active_masks[max_expert_chunks];
+     if constexpr (MULTI_CHUNK) {
+       for (int chunk = 0; chunk < num_expert_chunks; ++chunk) {
+         int expert_idx = chunk * 32 + lane_in_warp;
+         int chunk_src = (expert_idx < num_of_local_experts) ? token_routing[expert_idx] : 0;
+         active_masks[chunk] = __ballot_sync(0xFFFFFFFF, chunk_src > 0);
+       }
+     } else {
+       my_src = (lane_in_warp < num_of_local_experts) ? token_routing[lane_in_warp] : 0;
+       active_mask = __ballot_sync(0xFFFFFFFF, my_src > 0);
+     }
+
+     float accumulator[num_eles_per_float4];
+     float4 buffer_fp4;
+     DType* buffer_ptr = reinterpret_cast<DType*>(&buffer_fp4);
+
+     for (int64_t j = group_lane; j < hidden_size_fp4; j += THREADS_PER_TOKEN) {
+       #pragma unroll
+       for (int k = 0; k < num_eles_per_float4; k++) {
+         accumulator[k] = 0.0f;
+       }
+
+       for (int chunk = 0; chunk < (MULTI_CHUNK ? num_expert_chunks : 1); ++chunk) {
+         int expert_base = chunk * 32;
+         unsigned mask = MULTI_CHUNK ? active_masks[chunk] : active_mask;
+         while (mask) {
+           int e = __ffs(mask) - 1;
+           mask &= mask - 1;
+           int source_token_id = MULTI_CHUNK ? token_routing[expert_base + e]
+                                             : __shfl_sync(0xFFFFFFFF, my_src, e);
+
+           buffer_fp4 = permuted_tokens_fp4[(source_token_id - 1) * hidden_size_fp4 + j];
+           #pragma unroll
+           for (int k = 0; k < num_eles_per_float4; k++) {
+             accumulator[k] += DType2Float<DType>(buffer_ptr[k]);
+           }
+         }
+       }
+
+       #pragma unroll
+       for (int k = 0; k < num_eles_per_float4; k++) {
+         buffer_ptr[k] = Float2DType<DType>(accumulator[k]);
+       }
+       tokens_fp4[token_id * hidden_size_fp4 + j] = buffer_fp4;
+     }
+
+     if (permuted_probs != nullptr) {
+       for (int64_t j = group_lane; j < num_of_local_experts * num_ranks_per_node;
+            j += THREADS_PER_TOKEN) {
+         float value = 0.0f;
+         if (j / num_of_local_experts == local_rank) {
+           int expert_idx = j % num_of_local_experts;
+           int source_token_id = token_routing[expert_idx];
+           if (source_token_id > 0) {
+             value = static_cast<float>(permuted_probs[source_token_id - 1]);
+           }
+         }
+         probs[token_id * num_of_local_experts * num_ranks_per_node + j] =
+             static_cast<ProbType>(value);
+       }
+     }
+   }
+ }
  
  template <typename DType, typename ProbType>
  void unpermute_launcher(UnpermuteArgs args) {
@@ -533,25 +766,66 @@
    assert((std::is_same<DType, uint16_t>::value));
    assert((std::is_same<ProbType, float>::value));
    assert(args.hidden_size % 2 == 0);
+   assert(args.num_of_local_experts <= 256);
  
+   const char* ref_env = std::getenv("HYBRID_EP_USE_UNPERMUTE_REFERENCE");
+   bool use_reference = ref_env && (ref_env[0] == '1');
+
    constexpr int block_size = 512;
-   constexpr int tokens_per_block = block_size / 128;
    int grid_size = args.num_of_blocks_unpermute;
-   int shared_mem_size = args.num_of_local_experts * tokens_per_block * sizeof(int);
- 
-   unpermute_kernel<<<grid_size, block_size, shared_mem_size, args.stream>>>(
-       reinterpret_cast<__nv_bfloat16*>(args.permuted_tokens.data_ptr()),
-       reinterpret_cast<__nv_bfloat16*>(args.tokens_ptr),
-       args.with_probs ? reinterpret_cast<float*>(args.permuted_probs.value().data_ptr()) : nullptr,
-       args.with_probs ? reinterpret_cast<float*>(args.probs_ptr) : nullptr, 
-       args.row_id_map.data_ptr<int>(),
-       args.num_dispatched_tokens_tensor.data_ptr<int>(), 
-       args.num_of_local_experts, 
-       args.hidden_size, 
-       args.local_rank,
-       args.num_ranks_per_node
-    );
- 
+   int hidden_size_fp4 = args.hidden_size / static_cast<int>(sizeof(float4) / sizeof(DType));
+
+   if (use_reference) {
+     constexpr int tokens_per_block = block_size / 128;
+     int shared_mem_size = args.num_of_local_experts * tokens_per_block * sizeof(int);
+     unpermute_kernel_reference<<<grid_size, block_size, shared_mem_size, args.stream>>>(
+         reinterpret_cast<__nv_bfloat16*>(args.permuted_tokens.data_ptr()),
+         reinterpret_cast<__nv_bfloat16*>(args.tokens_ptr),
+         args.with_probs ? reinterpret_cast<float*>(args.permuted_probs.value().data_ptr()) : nullptr,
+         args.with_probs ? reinterpret_cast<float*>(args.probs_ptr) : nullptr,
+         args.row_id_map.data_ptr<int>(),
+         args.num_dispatched_tokens_tensor.data_ptr<int>(),
+         args.num_of_local_experts,
+         args.hidden_size,
+         args.local_rank,
+         args.num_ranks_per_node
+      );
+   } else {
+     #define UNPERMUTE_LAUNCH(TPT, MULTI_CHUNK) \
+       unpermute_kernel<TPT, MULTI_CHUNK, block_size><<<grid_size, block_size, 0, args.stream>>>( \
+           reinterpret_cast<__nv_bfloat16*>(args.permuted_tokens.data_ptr()), \
+           reinterpret_cast<__nv_bfloat16*>(args.tokens_ptr), \
+           args.with_probs ? reinterpret_cast<float*>(args.permuted_probs.value().data_ptr()) : nullptr, \
+           args.with_probs ? reinterpret_cast<float*>(args.probs_ptr) : nullptr, \
+           args.row_id_map.data_ptr<int>(), \
+           args.num_dispatched_tokens_tensor.data_ptr<int>(), \
+           args.num_of_local_experts, \
+           args.hidden_size, \
+           args.local_rank, \
+           args.num_ranks_per_node)
+
+     bool multi_chunk = args.num_of_local_experts > 32;
+     if (hidden_size_fp4 <= 64) {
+       if (multi_chunk) {
+         UNPERMUTE_LAUNCH(32, true);
+       } else {
+         UNPERMUTE_LAUNCH(32, false);
+       }
+     } else if (hidden_size_fp4 <= 128) {
+       if (multi_chunk) {
+         UNPERMUTE_LAUNCH(64, true);
+       } else {
+         UNPERMUTE_LAUNCH(64, false);
+       }
+     } else {
+       if (multi_chunk) {
+         UNPERMUTE_LAUNCH(128, true);
+       } else {
+         UNPERMUTE_LAUNCH(128, false);
+       }
+     }
+     #undef UNPERMUTE_LAUNCH
+   }
+
    CUDA_CHECK(cudaGetLastError());
  }
- 
