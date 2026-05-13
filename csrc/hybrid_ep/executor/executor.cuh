@@ -166,4 +166,3 @@ private:
     InterNodeCombineBuffers *inter_node_combine_buffers = nullptr;
 #endif
 };
-

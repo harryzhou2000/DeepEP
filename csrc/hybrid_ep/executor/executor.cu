@@ -129,6 +129,7 @@ HandleImpl Executor::metadata_preprocess_core(
   int32_t *dense_chunk_layout_ptr = nullptr;
   int32_t *dense_to_expert_map_ptr = nullptr;
   int32_t *tokens_per_expert_ptr = nullptr;
+  int32_t *row_id_map_ptr = nullptr;
   handle.overflow_flag =
       torch::empty({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
   if(fuse_permute_dispatch && enable_permute) {
@@ -145,6 +146,14 @@ HandleImpl Executor::metadata_preprocess_core(
     dense_chunk_layout_ptr = handle.dense_chunk_layout.data_ptr<int32_t>();
     dense_to_expert_map_ptr = handle.dense_to_expert_map.data_ptr<int32_t>();
     tokens_per_expert_ptr = handle.tokens_per_expert.data_ptr<int32_t>();
+  } else if(enable_permute) {
+    handle.row_id_map = torch::empty(
+        {max_num_dispatched_tokens + config.pad_multiple, config.num_of_experts_per_rank},
+        torch::dtype(torch::kInt32).device(torch::kCUDA));
+    handle.tokens_per_expert =
+        torch::empty({config.num_of_experts_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    row_id_map_ptr = handle.row_id_map.data_ptr<int32_t>();
+    tokens_per_expert_ptr = handle.tokens_per_expert.data_ptr<int32_t>();
   }
 
   kernel_cache.run_preprocess_kernel(
@@ -154,31 +163,17 @@ HandleImpl Executor::metadata_preprocess_core(
       handle.rdma_to_attn_map.data_ptr<bool>(), handle.attn_to_rdma_map.data_ptr<bool>(),
       handle.num_dispatched_tokens_tensor.data_ptr<int32_t>(),
       handle.local_expert_routing_map.data_ptr<bool>(), 
+      row_id_map_ptr,
       dense_chunk_layout_ptr, dense_to_expert_map_ptr, tokens_per_expert_ptr, 
       handle.overflow_flag.data_ptr<int>(),
       static_cast<int>(node_rank), static_cast<int>(local_rank), 
       static_cast<int>(handle.num_permuted_tokens < 0 ? std::numeric_limits<int>::max() : handle.num_permuted_tokens),
-      num_of_tokens_per_rank, fuse_permute_dispatch, non_blocking, stream);
+      num_of_tokens_per_rank, fuse_permute_dispatch, enable_permute && !fuse_permute_dispatch, non_blocking, stream);
 
-
-  if(!fuse_permute_dispatch && enable_permute) {
-    // Standalone path: permute_preprocessing produces padded tokens_per_expert directly.
-    std::tie(handle.row_id_map, handle.tokens_per_expert, handle.overflow_flag) = permute_preprocessing(
-        handle.local_expert_routing_map.data_ptr<bool>(), 
-        handle.num_dispatched_tokens_tensor,
-        max_num_dispatched_tokens, 
-        config.num_of_experts_per_rank, 
-        pad_multiple, 
-        config.num_of_blocks_preprocessing_api,
-        handle.num_permuted_tokens,
-        non_blocking,
-        stream
-    );
-  }
 
   if(enable_permute) {
-    // Both paths: handle.tokens_per_expert is raw int32 on GPU.
-    // Produce padded_tokens_per_expert (pinned or device int64) via pad kernel.
+    // Fused scan writes raw counts; standalone scan writes already-padded counts.
+    // pad_tokens_per_expert is idempotent for the standalone path.
     if (non_blocking) {
         handle.padded_tokens_per_expert = torch::empty(
             {config.num_of_experts_per_rank},

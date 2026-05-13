@@ -100,7 +100,7 @@ NVCCCompiler::NVCCCompiler(std::string base_path, std::string comm_id):
 }
   
 
-std::string NVCCCompiler::build(std::string code, std::string signature, int local_rank, int node_rank, int num_of_nodes, bool enable_permute_fusion, bool enable_token_drop) {
+std::string NVCCCompiler::build(std::string code, std::string signature, int local_rank, int node_rank, int num_of_nodes, bool enable_permute_fusion, bool enable_token_drop, bool enable_scan_fusion_permute_preprocess) {
     // Create the source directory
     std::filesystem::create_directories(jit_dir);
 
@@ -131,6 +131,9 @@ std::string NVCCCompiler::build(std::string code, std::string signature, int loc
     }
     if (enable_token_drop) {
         extra_flags += " -DHYBRID_EP_BUILD_TOKEN_DROP_ENABLE";
+    }
+    if (enable_scan_fusion_permute_preprocess) {
+        extra_flags += " -DHYBRID_EP_BUILD_SCAN_FUSION_PERMUTE_PREPROCESS_ENABLE";
     }
 
     // Choose the flags based on the number of nodes
@@ -323,6 +326,7 @@ void KernelCache::run_preprocess_kernel(
     bool* attn_to_rdma_map,
     int32_t* num_of_tokens_for_experts,
     bool* local_expert_routing_map,
+    int32_t* row_id_map,
     int32_t* dense_chunk_layout,
     int32_t* dense_to_expert_map,
     int32_t* num_of_local_experts_tokens,
@@ -332,6 +336,7 @@ void KernelCache::run_preprocess_kernel(
     const int local_experts_tokens_limit,
     const int num_of_tokens_per_rank,
     bool fuse_permute_dispatch,
+    bool enable_scan_fusion_permute_preprocess,
     bool non_blocking,
     cudaStream_t stream
 ){
@@ -349,23 +354,24 @@ void KernelCache::run_preprocess_kernel(
         config.num_of_blocks_preprocessing_api,
         config.topk,
         fuse_permute_dispatch,
+        enable_scan_fusion_permute_preprocess,
         non_blocking
     );
     
     auto it = kernel_cache.find(preprocess_kernel_key);
     if (it == kernel_cache.end()) {
         auto preprocessing_code = nvcc_compiler.get_metadata_preprocessing_code(config);
-        auto preprocessing_path = nvcc_compiler.build(preprocessing_code, preprocess_kernel_key, local_rank, node_rank, config.num_of_nodes, fuse_permute_dispatch, enable_token_drop);
+        auto preprocessing_path = nvcc_compiler.build(preprocessing_code, preprocess_kernel_key, local_rank, node_rank, config.num_of_nodes, fuse_permute_dispatch, enable_token_drop, enable_scan_fusion_permute_preprocess);
         kernel_cache[preprocess_kernel_key] = nvcc_compiler.get_instance(preprocessing_path, preprocess_kernel_key);
     }
     auto preprocessing_instance = kernel_cache[preprocess_kernel_key];
 
     // Cast the function pointer to the correct type
-    using PreprocessingFuncPtr = void (*)(const void*, hybrid_ep::tmp_state_t*, hybrid_ep::tmp_state_t*, int32_t*, bool*, bool*, int32_t*, bool*, int32_t*, int32_t*, int32_t*, int*, const int, const int, const int, const int, cudaStream_t);
+    using PreprocessingFuncPtr = void (*)(const void*, hybrid_ep::tmp_state_t*, hybrid_ep::tmp_state_t*, int32_t*, bool*, bool*, int32_t*, bool*, int32_t*, int32_t*, int32_t*, int32_t*, int*, const int, const int, const int, const int, cudaStream_t);
     auto func_ptr = std::any_cast<PreprocessingFuncPtr>(preprocessing_instance);
 
     // Run the kernel
-    func_ptr(input_routing_map, preprocessing_tmp, preprocessing_local_experts_tmp, sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, num_of_tokens_for_experts, local_expert_routing_map, dense_chunk_layout, dense_to_expert_map, num_of_local_experts_tokens, token_drop_triggered, node_rank, local_rank, local_experts_tokens_limit, num_of_tokens_per_rank, stream);
+    func_ptr(input_routing_map, preprocessing_tmp, preprocessing_local_experts_tmp, sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, num_of_tokens_for_experts, local_expert_routing_map, row_id_map, dense_chunk_layout, dense_to_expert_map, num_of_local_experts_tokens, token_drop_triggered, node_rank, local_rank, local_experts_tokens_limit, num_of_tokens_per_rank, stream);
 
 }
 

@@ -50,7 +50,10 @@ struct combine_gpu_nixl_ctx {
 } // namespace hybrid_ep
 #endif // USE_NIXL
 #endif // HYBRID_EP_BUILD_MULTINODE_ENABLE
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#if defined(HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE) || defined(HYBRID_EP_BUILD_SCAN_FUSION_PERMUTE_PREPROCESS_ENABLE)
+#define HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
+#endif
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
 #include <cuda_pipeline_primitives.h>
 #endif
 
@@ -4905,6 +4908,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
                      bool* attn_to_rdma_map,
                      int32_t* num_of_tokens_for_experts,
                      bool* local_expert_routing_map,
+                     int32_t* row_id_map,
                      int32_t* dense_chunk_layout,
                      int32_t* dense_to_expert_map,
                      int32_t* num_of_local_experts_tokens,
@@ -4977,34 +4981,36 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
 
   // How do a warp save per-rank routing info back to shared memory. What's the max number of elements does each thread save back.
   constexpr int NUM_OF_RANKS_PER_THREAD = ((NUM_OF_RANKS_PER_NODE - 1) / WARP_SIZE) + 1;
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
   // How do a warp save local experts' routing info back to shared memory. What's the max number of elements does each thread save back.
   constexpr int NUM_OF_LOCAL_EXPERTS_PER_THREAD = ((NUM_OF_EXPERTS_PER_RANK - 1) / WARP_SIZE) + 1;
 #endif
 
   // Sum of per-rank routing info of all warps within the block.
   __shared__ int32_t warp_token_routing_map_sum[NUM_OF_WARPS_PER_BLOCK][NUM_OF_RANKS_PER_NODE];
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
   // Sum of local experts' routing info of all warps within the block.
   __shared__ int32_t warp_token_local_experts_routing_map_sum[NUM_OF_WARPS_PER_BLOCK][NUM_OF_EXPERTS_PER_RANK];
 #endif
   // Sum of previous blocks' per-rank routing info.
   __shared__ int32_t previous_block_sum[NUM_OF_RANKS_PER_NODE];
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
   // Sum of all blocks' local experts' routing info.
   __shared__ int32_t all_block_local_experts_sum[NUM_OF_EXPERTS_PER_RANK];
   // Sum of previous blocks' local experts' routing info accumulated with previous local experts' routing info.
   __shared__ int32_t previous_block_local_experts_sum[NUM_OF_EXPERTS_PER_RANK];
 #endif
+#ifdef HYBRID_EP_BUILD_SCAN_FUSION_PERMUTE_PREPROCESS_ENABLE
+  __shared__ int32_t total_num_of_tokens_for_local_rank;
+#endif
 
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
   // Init shared memory which are used as accumulator.
   for(int i = threadIdx.x; i < NUM_OF_EXPERTS_PER_RANK; i += NUM_THREADS_PER_BLOCK){
     all_block_local_experts_sum[i] = 0;
     previous_block_local_experts_sum[i] = 0;
   }
 #endif
-
   // We assign contiguous tokens called chunk to each CUDA block, each CUDA block get the same size of chunk.
   int block_starting_token = blockIdx.x * num_of_tokens_per_block;
   // warp id and lane id.
@@ -5026,7 +5032,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
     token_routing_map_sum[i] = 0;
   }
 
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
   // Sum of local experts' token routing map within a thread.
   int32_t token_local_experts_routing_map_sum[NUM_OF_EXPERTS_PER_RANK];
   #pragma unroll
@@ -5092,7 +5098,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
           token_routing_map_sum[j] += 1;
         }
       }
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
       // For permute fusion: compute per-local-expert routing.
       #pragma unroll
       for(int k = 0; k < TOPK; k++){
@@ -5133,7 +5139,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
           token_routing_map_sum[j] += 1;
           token_needed_by_this_node = true;
         }
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
         if(j == local_rank){
           int current_local_expert_id = j * NUM_OF_EXPERTS_PER_RANK;
           #pragma unroll
@@ -5171,7 +5177,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
     }
   }
 
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
   // When permute fusion is enabled, each warp sum the local experts' routing info from all its threads.
   #pragma unroll
   for(int i = 0; i < NUM_OF_EXPERTS_PER_RANK; i++){
@@ -5222,7 +5228,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
                   : "memory");
   }
 
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
   // When permute fusion is enabled, each thread within a CUDA block calculate the CUDA block level sum for a local expert at a time.
   for(int i = threadIdx.x; i < NUM_OF_EXPERTS_PER_RANK; i += NUM_THREADS_PER_BLOCK){
     int32_t local_expert_acc = 0;
@@ -5265,7 +5271,28 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
     previous_block_sum[i] = previous_block_sum_for_current_rank;
   }
 
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_SCAN_FUSION_PERMUTE_PREPROCESS_ENABLE
+  if(threadIdx.x == 0){
+    int32_t total_sum_for_local_rank = 0;
+    for(int j = 0; j < NUM_OF_BLOCKS; j++){
+      tmp_state_t tmp_data{EMPTY, 0};
+      tmp_state_t* tmp_src = &tmp[j * NUM_OF_RANKS_PER_NODE + local_rank];
+      do{
+          uint64_t data = 0;
+          asm volatile("ld.relaxed.gpu.global.b64 %0, [%1];"
+                        : "=l"(data)
+                        : "l"(__cvta_generic_to_global(tmp_src))
+                        : "memory");
+          tmp_data = *reinterpret_cast<tmp_state_t*>(&data);
+      }while(tmp_data.state != PRIV_SUM);
+      total_sum_for_local_rank += tmp_data.value;
+    }
+    total_num_of_tokens_for_local_rank = total_sum_for_local_rank;
+    *num_of_tokens_for_experts = total_sum_for_local_rank;
+  }
+#endif
+
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
   // When permute fusion is enabled, all threads within a CUDA block load all blocks' block level sum and accumulate to shared memory.
   for(int i = threadIdx.x; i < NUM_OF_EXPERTS_PER_RANK * NUM_OF_BLOCKS; i += NUM_THREADS_PER_BLOCK){
     // Which block and which local expert is this sum element belongs to.
@@ -5297,7 +5324,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
   // When permute fusion is enabled, also make sure all and previous blocks' local experts' sum have been produced to the shared memory.
   __syncthreads();
 
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE 
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
   // Load sum of all blocks' local experts' routing info to produce the accumulation of previous local experts' routing info. 
   int32_t thread_local_all_block_local_experts_sum[NUM_OF_EXPERTS_PER_RANK];
   // Only threads which will participate in accumulation will need to load the data from the shared memory.
@@ -5373,14 +5400,28 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
         }
       }
     }
+#elif defined(HYBRID_EP_BUILD_SCAN_FUSION_PERMUTE_PREPROCESS_ENABLE)
+    if(blockIdx.x == 0){
+      int32_t current_expert_valid_tokens = thread_local_all_block_local_experts_sum[i];
+      int num_of_padding_tile = (current_expert_valid_tokens % LOCAL_EXPERTS_PADDING_SIZE == 0) ? (current_expert_valid_tokens / LOCAL_EXPERTS_PADDING_SIZE)
+                                                                                                  : (current_expert_valid_tokens / LOCAL_EXPERTS_PADDING_SIZE + 1);
+      int32_t current_expert_tokens_with_padding = num_of_padding_tile * LOCAL_EXPERTS_PADDING_SIZE;
+      int32_t overflow_num = current_expert_tokens_with_padding + previous_experts_acc - local_experts_tokens_limit;
+      if(overflow_num <= 0){
+        num_of_local_experts_tokens[i] = current_expert_tokens_with_padding;
+      }else{
+        num_of_local_experts_tokens[i] = max(0, (int)(current_expert_tokens_with_padding - overflow_num));
+        *token_drop_triggered = 1;
+      }
+    }
 #endif
   }
 
-  // Sync within a CUDA block to make sure all the final accumulated previous blocks' local experts' routing info have been produced to the shared memory 
+  // Sync within a CUDA block to make sure all the final accumulated previous blocks' local experts' routing info have been produced to the shared memory
   // before any thread can consume them in scan operation.
   __syncthreads();
 
-#ifndef HYBRID_EP_BUILD_TOKEN_DROP_ENABLE
+#if !defined(HYBRID_EP_BUILD_TOKEN_DROP_ENABLE) && !defined(HYBRID_EP_BUILD_SCAN_FUSION_PERMUTE_PREPROCESS_ENABLE)
   // First block will need to save all local experts' sum back to output buffer.
   if(blockIdx.x == 0){
     for(int i = threadIdx.x; i < NUM_OF_EXPERTS_PER_RANK; i += NUM_THREADS_PER_BLOCK){
@@ -5393,7 +5434,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
   // Step 2: Each warp scan the sub-chunk assigned to them(the same sub-chunk as step 0) and produce sparse_to_dense_map, local_expert_routing_map and num_of_tokens_for_experts.
   int32_t previous_token_sum[NUM_OF_RANKS_PER_NODE];
 
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE 
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
   // When permute fusion is enabled, each warp will also need to scan and produce dense_chunk_layout and dense_to_expert_map.
   int32_t previous_token_local_experts_sum[NUM_OF_EXPERTS_PER_RANK];
 #endif
@@ -5427,7 +5468,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
     previous_token_sum[i] = __shfl_sync(~0, previous_token_sum[src_id], src_tid);
   }
 
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
   // When permute fusion is enabled, each warp load the previous blocks' local experts' sum from shared memory.
   #pragma unroll
   for(int i = 0; i < NUM_OF_LOCAL_EXPERTS_PER_THREAD; i++){
@@ -5561,7 +5602,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
       // Calculate the final exclusive scan for current token. -1 represent that the current rank does not need the current token. 
       final_ex_scan[j] = token_needed_by_this_rank ? previous_token_sum[j] + temp_scan : -1;
 
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
       // When permute fusion is enabled, we need to do extra work to local experts of local rank.
       if(j == local_rank){
         int32_t final_local_experts_ex_scan[NUM_OF_EXPERTS_PER_RANK];
@@ -5597,6 +5638,7 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
 #endif
           previous_token_local_experts_sum[k] += local_expert_temp_sum;
         }
+#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
         // Then save the ex-scan back to dense_to_expert map if the current token is needed by local rank.
         if(token_needed_by_this_rank){
           local_experts_write_t* dense_to_expert_map_store_base_addr = reinterpret_cast<local_experts_write_t*>(dense_to_expert_map + final_ex_scan[j] * NUM_OF_EXPERTS_PER_RANK);
@@ -5609,6 +5651,24 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
         if(token_needed_by_dense_chunk_layout){
           dense_chunk_layout[current_token_global_chunk_id - 1] = previous_token_sum[j] + temp_scan;
         }
+#endif
+#ifdef HYBRID_EP_BUILD_SCAN_FUSION_PERMUTE_PREPROCESS_ENABLE
+        if(token_needed_by_this_rank){
+          int32_t* row_id_map_store_base_addr = row_id_map + final_ex_scan[j] * NUM_OF_EXPERTS_PER_RANK;
+          #pragma unroll
+          for(int k = 0; k < NUM_OF_EXPERTS_PER_RANK; k++){
+            int32_t expert_scan = final_local_experts_ex_scan[k];
+            if(expert_scan >= 0 && expert_scan < local_experts_tokens_limit){
+              row_id_map_store_base_addr[k] = expert_scan + 1;
+            }else{
+              row_id_map_store_base_addr[k] = 0;
+              if(expert_scan >= local_experts_tokens_limit){
+                *token_drop_triggered = 1;
+              }
+            }
+          }
+        }
+#endif
       }
 #else
       // Each thread save local routing map for this token of the local rank to local_expert_routing_map if this token is needed by the local rank.
@@ -5670,6 +5730,43 @@ __global__ void scan(const void* input_routing_data,  // bool* (TOPK==0) or int1
       }
     }
   }
+
+#ifdef HYBRID_EP_BUILD_SCAN_FUSION_PERMUTE_PREPROCESS_ENABLE
+  // Emit the negative row_id_map entries used by standalone permute to zero-fill
+  // per-expert padding tokens. The standalone permute kernel only reads these
+  // rows when the runtime pad_multiple argument is positive.
+  for(int padding_row = blockIdx.x; padding_row < LOCAL_EXPERTS_PADDING_SIZE; padding_row += gridDim.x){
+    int32_t* row_id_map_store_base_addr = row_id_map + (total_num_of_tokens_for_local_rank + padding_row) * NUM_OF_EXPERTS_PER_RANK;
+    for(int expert_id = threadIdx.x; expert_id < NUM_OF_EXPERTS_PER_RANK; expert_id += NUM_THREADS_PER_BLOCK){
+      int32_t expert_token_count = all_block_local_experts_sum[expert_id];
+      int num_of_padding_tile = (expert_token_count % LOCAL_EXPERTS_PADDING_SIZE == 0) ? (expert_token_count / LOCAL_EXPERTS_PADDING_SIZE)
+                                                                                         : (expert_token_count / LOCAL_EXPERTS_PADDING_SIZE + 1);
+      int32_t expert_token_count_with_padding = num_of_padding_tile * LOCAL_EXPERTS_PADDING_SIZE;
+      int32_t num_padding_tokens = expert_token_count_with_padding - expert_token_count;
+      if(padding_row < num_padding_tokens){
+        int32_t previous_experts_acc = 0;
+        #pragma unroll
+        for(int j = 0; j < NUM_OF_EXPERTS_PER_RANK; j++){
+          if(j < expert_id){
+            int32_t previous_expert_token_count = all_block_local_experts_sum[j];
+            int previous_expert_padding_tile = (previous_expert_token_count % LOCAL_EXPERTS_PADDING_SIZE == 0) ? (previous_expert_token_count / LOCAL_EXPERTS_PADDING_SIZE)
+                                                                                                               : (previous_expert_token_count / LOCAL_EXPERTS_PADDING_SIZE + 1);
+            previous_experts_acc += previous_expert_padding_tile * LOCAL_EXPERTS_PADDING_SIZE;
+          }
+        }
+        int32_t padded_offset = -(expert_token_count + previous_experts_acc + padding_row + 1);
+        if(abs(padded_offset) > local_experts_tokens_limit){
+          row_id_map_store_base_addr[expert_id] = 0;
+          *token_drop_triggered = 1;
+        }else{
+          row_id_map_store_base_addr[expert_id] = padded_offset;
+        }
+      }else{
+        row_id_map_store_base_addr[expert_id] = 0;
+      }
+    }
+  }
+#endif
 
 #ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
   // Step 3: When NUM_OF_NODES > 1, we need to produce attn_to_rdma_map.
@@ -5792,6 +5889,8 @@ public:
   // The per-expert routing info for all tokens within the expert buffer of this rank. It is used by later layer to routing the tokens to different experts on this rank.
   // Valid only when permute fusion is NOT enabled.
   // Remains the same in a trainning iteration(FW+BP).
+  // row_id_map: IO: output, dtype: int32_t, shape: [at least num_of_tokens_for_experts + LOCAL_EXPERTS_PADDING_SIZE, NUM_OF_EXPERTS_PER_RANK].
+  // Standalone permute/unpermute routing map. Valid only when HYBRID_EP_BUILD_SCAN_FUSION_PERMUTE_PREPROCESS_ENABLE is enabled.
   // dense_chunk_layout: IO: output, dtype: int32_t, shape: [num_of_chunks_per_rank * num_of_total_ranks].
   // What's the starting location of each attn token chunk within the local rank's per-rank buffer. dense_chunk_layout[i + 1] - dense_chunk_layout[i] means chunk size of (i + 1) chunk.
   // Valid only when permute fusion is enabled.
@@ -5817,6 +5916,7 @@ public:
                                      bool* attn_to_rdma_map,
                                      int32_t* num_of_tokens_for_experts,
                                      bool* local_expert_routing_map,
+                                     int32_t* row_id_map,
                                      int32_t* dense_chunk_layout,
                                      int32_t* dense_to_expert_map,
                                      int32_t* num_of_local_experts_tokens,
@@ -5841,16 +5941,19 @@ public:
     // Init preprocessing_tmp buffers.
     constexpr size_t preprocessing_tmp_sz = NUM_OF_BLOCKS * NUM_OF_RANKS_PER_NODE * sizeof(tmp_state_t);
     CUDA_CHECK(cudaMemsetAsync(preprocessing_tmp, 0, preprocessing_tmp_sz, stream));
-#ifdef HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE
-    // When permute fusion is enabled, also init preprocessing_tmp buffers for local expert scan.
+#ifdef HYBRID_EP_BUILD_LOCAL_EXPERT_SCAN_ENABLE
+    // Local expert scan is needed by fused permute metadata and by the scan-fused row_id_map fast path.
     constexpr size_t preprocessing_local_experts_tmp_sz = NUM_OF_BLOCKS * NUM_OF_EXPERTS_PER_RANK * sizeof(tmp_state_t);
     CUDA_CHECK(cudaMemsetAsync(preprocessing_local_experts_tmp, 0, preprocessing_local_experts_tmp_sz, stream));
+#endif
+#ifdef HYBRID_EP_BUILD_SCAN_FUSION_PERMUTE_PREPROCESS_ENABLE
+    CUDA_CHECK(cudaMemsetAsync(token_drop_triggered, 0, sizeof(int), stream));
 #endif
 
     // Launch the preprocessing kernel to process the global routing map.
     scan<NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, LOCAL_EXPERTS_PADDING_SIZE, MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_EXPERTS_PER_RANK, TOPK>
     <<<NUM_OF_BLOCKS, NUM_THREADS_PER_BLOCK, 0, stream>>>
-    (input_routing_data, preprocessing_tmp, preprocessing_local_experts_tmp, sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, num_of_tokens_for_experts, local_expert_routing_map,
+    (input_routing_data, preprocessing_tmp, preprocessing_local_experts_tmp, sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, num_of_tokens_for_experts, local_expert_routing_map, row_id_map,
     dense_chunk_layout, dense_to_expert_map, num_of_local_experts_tokens, token_drop_triggered, node_rank, local_rank, local_experts_tokens_limit, num_of_tokens_per_rank);
 
     // Check if there is any CUDA error.

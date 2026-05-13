@@ -40,9 +40,10 @@ public:
     * @param node_rank The node rank of the current process
     * @param num_of_nodes The number of nodes in the communication
     * @param enable_permute_fusion Whether to enable HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE macro (for fused permute-dispatch or fused unpermute-combine)
+    * @param enable_scan_fusion_permute_preprocess Whether scan should produce scan-fused row_id_map metadata
     * @return std::string The path of the compiled .so file
     */
-    std::string build(std::string code, std::string signature, int local_rank, int node_rank, int num_of_nodes, bool enable_permute_fusion = false, bool enable_token_drop = false);
+    std::string build(std::string code, std::string signature, int local_rank, int node_rank, int num_of_nodes, bool enable_permute_fusion = false, bool enable_token_drop = false, bool enable_scan_fusion_permute_preprocess = false);
 
     /**
     * @brief Get the compiled function pointer from the compiled .so file
@@ -78,6 +79,7 @@ public:
         bool* attn_to_rdma_map,
         int32_t* num_of_tokens_for_experts,
         bool* local_expert_routing_map,
+        int32_t* row_id_map,
         int32_t* dense_chunk_layout,
         int32_t* dense_to_expert_map,
         int32_t* num_of_local_experts_tokens,
@@ -87,6 +89,7 @@ public:
         const int local_experts_tokens_limit,
         int num_of_tokens_per_rank,
         bool fuse_permute_dispatch,
+        bool enable_scan_fusion_permute_preprocess,
         bool non_blocking,
         cudaStream_t stream
     );
