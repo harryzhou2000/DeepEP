@@ -266,6 +266,11 @@ def test_direct_dispatch(buffer, group):
 
 
 def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+    # When running under ncu, extend NCCL timeout to avoid timeouts during kernel replay
+    ncu_mode = os.environ.get('DEEP_EP_NCU_MODE') == '1'
+    if ncu_mode:
+        os.environ.setdefault('NCCL_TIMEOUT', '1800')  # 30 min
+
     _, _, group = init_dist(local_rank, num_local_ranks)
 
     # Static budget for the direct-output buffer.
@@ -282,19 +287,83 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_sms_dispatch_api=NUM_SMS_DISPATCH,
         num_sms_combine_api=NUM_SMS_COMBINE,
         num_permuted_tokens_direct=num_permuted_tokens_direct,
+        load_cached_kernels=ncu_mode,
     )
 
-    success = test_direct_dispatch(buffer, group)
-    if not success:
-        dist.barrier()
-        dist.destroy_process_group()
-        if local_rank == 0:
-            raise RuntimeError("Direct-permute dispatch test FAILED")
-        return
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    num_experts = NUM_LOCAL_EXPERTS * world_size
 
-    # Benchmark: compare direct vs non-direct dispatch times
-    if args.benchmark:
-        test_benchmark(buffer, group)
+    if not ncu_mode:
+        success = test_direct_dispatch(buffer, group)
+        if not success:
+            dist.barrier()
+            dist.destroy_process_group()
+            if local_rank == 0:
+                raise RuntimeError("Direct-permute dispatch test FAILED")
+            return
+
+        # Benchmark: compare direct vs non-direct dispatch times
+        if args.benchmark:
+            test_benchmark(buffer, group)
+    else:
+        # NCU profiling mode: warmup + one profiled dispatch iteration
+        NCU_WARMUP = 3
+        torch.manual_seed(42 + rank)
+        hidden, probs, topk_idx, topk_weights = init_tensor(
+            HIDDEN_DIM, NUM_TOKENS_PER_RANK, TOPK, num_experts
+        )
+
+        # Allgather routing map
+        local_routing = topk_idx.to(torch.int16).contiguous()
+        global_routing = torch.empty(
+            NUM_TOKENS_PER_RANK * world_size, TOPK, dtype=torch.int16, device="cuda"
+        )
+        dist.all_gather_into_tensor(
+            global_routing.view(torch.int8),
+            local_routing.view(torch.int8),
+            group=group
+        )
+
+        # Warmup to JIT-compile and get num_permuted_tokens
+        direct_tokens, _, _, direct_tpe, direct_handle = buffer.dispatch_with_permute(
+            hidden=hidden,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_of_experts=num_experts,
+            num_permuted_tokens=int(NUM_TOKENS_PER_RANK * TOPK * 1.04),
+            pad_multiple=PAD_MULTIPLE,
+            dense_routing=True,
+            direct_permute=True,
+            global_routing_map=global_routing,
+        )
+        num_permuted_tokens = direct_tpe.sum().item()
+
+        dispatch_args = dict(
+            hidden=hidden,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_of_experts=num_experts,
+            num_permuted_tokens=num_permuted_tokens,
+            pad_multiple=PAD_MULTIPLE,
+            dense_routing=True,
+            direct_permute=True,
+            global_routing_map=global_routing,
+            handle=direct_handle,
+        )
+
+        for _ in range(NCU_WARMUP):
+            buffer.dispatch_with_permute(**dispatch_args)
+            torch.cuda.synchronize()
+        torch.cuda.synchronize()
+
+        torch.cuda.cudart().cudaProfilerStart()
+        buffer.dispatch_with_permute(**dispatch_args)
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+
+        if rank == 0:
+            print(f'  [ncu] profiled direct dispatch_kernel', flush=True)
 
     dist.barrier()
     dist.destroy_process_group()
@@ -389,5 +458,112 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Test direct-permute dispatch')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--benchmark', action='store_true', help='Run timing benchmark after correctness')
+    parser.add_argument('--local-rank', type=int, default=None,
+                       help='Run as a single process with the given local rank')
+    parser.add_argument('--ncu-profile', type=str, default=None, metavar='OUTPUT_PATH',
+                       help='Profile with ncu, saving report to OUTPUT_PATH. '
+                            'Re-launches self under ncu with --communicator tcp.')
+    parser.add_argument('--ncu-kernel', type=str, default='dispatch_kernel',
+                       help='Kernel name regex for ncu (default: dispatch_kernel)')
+    parser.add_argument('--ncu-metrics', type=str, default=None,
+                       help='Comma-separated ncu metrics (default: stall breakdown)')
+    parser.add_argument('--ncu-child', action='store_true', default=False,
+                       help=argparse.SUPPRESS)  # Internal flag: already running under ncu
     args = parser.parse_args()
-    torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)
+
+    if args.ncu_profile is not None and not args.ncu_child:
+        # Collective ncu profiling: ALL ranks run under their own ncu instance.
+        # ncu instances coordinate via --communicator tcp and synchronize kernel
+        # replay with --lockstep-kernel-launch.
+        import subprocess, sys
+        ncu_metrics = args.ncu_metrics or ','.join([
+            # Timing
+            'gpu__time_duration.sum',
+            # Warp occupancy
+            'sm__warps_active.avg.pct_of_peak_sustained_active',
+            # Warp stall breakdown
+            'smsp__warp_issue_stalled_barrier_per_warp_active.pct',
+            'smsp__warp_issue_stalled_membar_per_warp_active.pct',
+            'smsp__warp_issue_stalled_wait_per_warp_active.pct',
+            'smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct',
+            'smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct',
+            'smsp__warp_issue_stalled_not_selected_per_warp_active.pct',
+            'smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct',
+            'smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct',
+            'smsp__warp_issue_stalled_misc_per_warp_active.pct',
+            # NVLink traffic (bytes)
+            'nvlrx__bytes.sum',
+            'nvltx__bytes.sum',
+            'nvlrx__bytes_data_user.sum',
+            'nvltx__bytes_data_user.sum',
+            # NVLink throughput (% of peak)
+            'nvlrx__throughput.avg.pct_of_peak_sustained_elapsed',
+            'nvltx__throughput.avg.pct_of_peak_sustained_elapsed',
+            # DRAM traffic
+            'dram__bytes_read.sum',
+            'dram__bytes_write.sum',
+            # L1/SMEM
+            'l1tex__t_sectors_pipe_lsu.sum',
+            'l1tex__t_sectors_pipe_lsu_lookup_miss.sum',
+            # SM throughput
+            'sm__throughput.avg.pct_of_peak_sustained_elapsed',
+        ])
+
+        env = os.environ.copy()
+        env['DEEP_EP_NCU_MODE'] = '1'
+        env['MASTER_ADDR'] = '127.0.0.1'
+        env['MASTER_PORT'] = str(29500 + os.getpid() % 1000)
+        # init_dist treats WORLD_SIZE as num_nodes, RANK as node_rank.
+        # Single-node: WORLD_SIZE=1, RANK=0 -> total = 1 * num_local_ranks.
+        env['WORLD_SIZE'] = '1'
+        env['RANK'] = '0'
+        env['NCCL_TIMEOUT'] = '1800'  # 30 min for ncu slowdown
+
+        num_peers = args.num_processes
+        procs = []
+        for rank in range(num_peers):
+            base_cmd = [
+                sys.executable, __file__,
+                '--local-rank', str(rank),
+                '--num-processes', str(num_peers),
+                '--ncu-child',
+            ]
+            # Each rank runs under its own ncu instance with application replay.
+            # Kernel replay (default) fails on B300 with "Failed to save memory"
+            # because 275GB HBM + IPC memory exceeds ncu's save capacity.
+            # Application replay re-runs the profiled region multiple times instead.
+            # TCP communicator + lockstep ensures all ranks replay collectively.
+            cmd = [
+                'ncu',
+                '--replay-mode', 'application',
+                '--profile-from-start', 'off',
+                '--communicator', 'tcp',
+                '--communicator-tcp-num-peers', str(num_peers),
+                '--communicator-tcp-hostname', '127.0.0.1',
+                '--lockstep-kernel-launch',
+                '--kernel-name', args.ncu_kernel,
+                '--launch-count', '1',
+                '--metrics', ncu_metrics,
+                '-o', f'{args.ncu_profile}_rank{rank}', '-f',
+            ] + base_cmd
+            procs.append(subprocess.Popen(cmd, env=env))
+
+        # Wait for all
+        rc = 0
+        for p in procs:
+            p.wait()
+            if p.returncode != 0:
+                rc = p.returncode
+        if rc != 0:
+            print(f'[ncu-launcher] Some ranks failed with rc={rc}', flush=True)
+        sys.exit(rc)
+    elif args.local_rank is not None:
+        # Single-process mode (used by ncu launcher via --ncu-child)
+        if args.ncu_child:
+            os.environ['DEEP_EP_NCU_MODE'] = '1'
+        test_main(args.local_rank, args.num_processes, args)
+    else:
+        # Multi-process mode (normal)
+        if args.ncu_child:
+            os.environ['DEEP_EP_NCU_MODE'] = '1'
+        torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)
