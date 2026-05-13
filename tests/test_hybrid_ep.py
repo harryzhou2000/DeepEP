@@ -559,12 +559,19 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 num_of_ranks_per_node=NUM_OF_RANKS_PER_NODE,
             )
 
-            test_hybrid_ep_correctness(buffer, ref, use_fp8)
+            if os.environ.get('DEEP_EP_NCU_MODE') != '1':
+                test_hybrid_ep_correctness(buffer, ref, use_fp8)
             if os.environ.get('DEEP_EP_NCU_MODE') == '1':
                 # NCU profiling mode: run warmup + one profiled iteration.
                 # The profiled operation depends on --ncu-kernel:
                 #   dispatch_kernel → fused dispatch+permute
                 #   combine_kernel  → fused combine+unpermute (default)
+                #
+                # IMPORTANT: Do NOT use dist.barrier() or any NCCL collectives
+                # in NCU mode. With --lockstep-kernel-launch, ncu synchronizes
+                # ALL kernel launches across ranks. NCCL's internal kernel
+                # launch patterns are non-deterministic, causing lockstep to
+                # deadlock. Use cudaDeviceSynchronize instead of dist.barrier.
                 NCU_WARMUP = 3
                 ncu_kernel = os.environ.get('NCU_KERNEL_TARGET', 'combine_kernel')
                 ncu_fused = os.environ.get('NCU_FUSED', '0') == '1'
@@ -584,12 +591,11 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     for _ in range(NCU_WARMUP):
                         buffer.dispatch_with_permute(**dispatch_args)
                         torch.cuda.synchronize()
-                    dist.barrier()
+                    torch.cuda.synchronize()
                     torch.cuda.cudart().cudaProfilerStart()
                     buffer.dispatch_with_permute(**dispatch_args)
                     torch.cuda.synchronize()
                     torch.cuda.cudart().cudaProfilerStop()
-                    dist.barrier()
                     if dist.get_rank() == 0:
                         label = 'fused dispatch+permute' if ncu_fused else 'standalone dispatch'
                         print(f'  [ncu] profiled {label}', flush=True)
@@ -615,12 +621,11 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     for _ in range(NCU_WARMUP):
                         buffer.combine_with_unpermute(**combine_args)
                         torch.cuda.synchronize()
-                    dist.barrier()
+                    torch.cuda.synchronize()
                     torch.cuda.cudart().cudaProfilerStart()
                     buffer.combine_with_unpermute(**combine_args)
                     torch.cuda.synchronize()
                     torch.cuda.cudart().cudaProfilerStop()
-                    dist.barrier()
                     if dist.get_rank() == 0:
                         label = 'fused combine+unpermute' if ncu_fused else 'standalone combine'
                         print(f'  [ncu] profiled {label}', flush=True)
@@ -710,9 +715,14 @@ if __name__ == "__main__":
                 '--num-processes', str(num_peers),
                 '--ncu-child',
             ]
-            # Every rank runs under ncu with collective coordination
+            # Each rank runs under its own ncu instance with application replay.
+            # Kernel replay (default) fails on B300 with "Failed to save memory"
+            # because 275GB HBM + IPC memory exceeds ncu's save capacity.
+            # Application replay re-runs the profiled region multiple times instead.
+            # TCP communicator + lockstep ensures all ranks replay collectively.
             cmd = [
                 'ncu',
+                '--replay-mode', 'application',
                 '--profile-from-start', 'off',
                 '--communicator', 'tcp',
                 '--communicator-tcp-num-peers', str(num_peers),
